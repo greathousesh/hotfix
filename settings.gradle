@@ -1,0 +1,27 @@
+pluginManagement {
+    // 把插桩插件作为“包含构建”接入，使 id 'com.demo.hotfix.instrument' 可被解析
+    includeBuild 'hotfix-plugin'
+    repositories {
+        // 阿里云镜像优先（dl.google / mavenCentral 经由的 SOCKS 代理不可达时仍可解析）
+        maven { url 'https://maven.aliyun.com/repository/gradle-plugin' }
+        maven { url 'https://maven.aliyun.com/repository/google' }
+        maven { url 'https://maven.aliyun.com/repository/public' }
+        gradlePluginPortal()
+        google()
+        mavenCentral()
+    }
+}
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        maven { url 'https://maven.aliyun.com/repository/google' }
+        maven { url 'https://maven.aliyun.com/repository/public' }
+        maven { url 'https://maven.aliyun.com/repository/central' }
+        google()
+        mavenCentral()
+    }
+}
+rootProject.name = "HotfixDemo"
+include ':app'
+include ':hotfix-sdk'
+include ':patch-src'   // 仅 IDE 索引补丁源码；真正打补丁仍用 patch-src/build_patch.sh

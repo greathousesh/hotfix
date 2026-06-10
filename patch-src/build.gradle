@@ -1,0 +1,43 @@
+// 补丁模块：
+//  · 开发者唯一手写的补丁源是 patched/com/demo/app/Calculator.kt（修好的原始类，纯业务）。
+//  · com.demo.hotfix.patch 插件把整条打包流水线做成 Gradle 任务（generate/dex/linkRes/native），
+//    取代旧的 build_patch.sh。被修类的字节码直接取 AGP 的 compile{V}Kotlin 产物。
+//  · 只生成补丁产物，不做设备推送（推送请自行用 adb）。
+//  · AGP 自身产出的 aar 不是补丁；补丁产物在 build/patch/{debug,release}/ 与 build/patch/libpatch.so。
+// 入口：
+//    ./gradlew :patch-src:assemblePatchDebug     # 出 debug 三类产物
+//    ./gradlew :patch-src:assemblePatchRelease   # 出 release 三类产物（需先 :app:assembleRelease 产 mapping）
+plugins {
+    id 'com.android.library'
+    id 'org.jetbrains.kotlin.android'
+    id 'com.demo.hotfix.patch'
+}
+
+android {
+    namespace 'com.demo.patch'
+    compileSdk 35
+
+    defaultConfig {
+        minSdk 24
+    }
+    // 补丁源是非标准目录布局：patched/ 放修好的原始类；res_patch/ 放资源补丁。
+    sourceSets {
+        main {
+            java.srcDirs = ['patched']   // kotlin-android 会编译此目录下的 .kt
+            res.srcDirs = ['res_patch']
+            manifest.srcFile 'AndroidManifest.xml'
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+}
+
+dependencies {
+    // 仅解析接口(IpChange / PatchesLoader)，不进补丁产物 —— 运行时由宿主提供。
+    compileOnly project(':hotfix-sdk')
+}

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">MiniHotfix Demo</string>
+    <!-- 资源补丁会把这个字符串替换成新值 -->
+    <string name="patch_text">原始文案 v1.0（未打补丁）</string>
+</resources>

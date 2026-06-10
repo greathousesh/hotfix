@@ -1,0 +1,222 @@
+package com.demo.hotfix.plugin
+
+import org.objectweb.asm.ClassReader
+import org.objectweb.asm.ClassWriter
+import org.objectweb.asm.Opcodes
+import org.objectweb.asm.Type
+import org.objectweb.asm.commons.GeneratorAdapter
+import org.objectweb.asm.commons.Method as AsmMethod
+import org.objectweb.asm.tree.ClassNode
+import org.objectweb.asm.tree.MethodNode
+import java.io.File
+
+/**
+ * 从「开发者写好的修复版原始类」字节码，一次性生成补丁 dex 里需要的**全部**类（InstantPatch `$override` 风格）：
+ *   1) 每个被修类 -> 一个分发类 `com.demo.patch.<Simple>Patch`（实现 IpChange）
+ *   2) 一个 `com.demo.patch.PatchesLoaderImpl`（实现 PatchesLoader），把「运行时类名 -> new <Simple>Patch()」装进 Map
+ *
+ * 于是开发者唯一要写的就是 `patched/` 下修好的原始类，其余补丁代码全部由字节码生成、零手写样板。
+ *
+ * 为什么必须生成异名分发类、而不能直接发布修好的原始类：宿主进程已加载 `com.demo.app.Calculator`，
+ * 补丁 DexClassLoader(parent=宿主) 是 parent-first，补丁 dex 里同名类会被宿主版本屏蔽、永远加载不到。
+ * 所以把每个原方法转成 static 跳板（实例作首参），由宿主插桩的方法头 `ipcDispatch(...)` 转进来执行修好的逻辑。
+ *
+ * methodId 与 HotfixMethodVisitor 注入格式严格对齐：`owner以点分隔 + "." + 方法名 + 描述符`（如
+ * `com.demo.app.Calculator.add(II)I`），约定 args[0]=this（实例方法），其后为实参（基本类型已装箱）。
+ *
+ * 由 HotfixPatchPlugin 的 generatePatchClasses{V} 任务在 Gradle daemon 进程内直接调用 [generate]。
+ * mappingFile 用于把被修类解析成运行时(R8 混淆)类名；debug/无混淆传 null 则用原始名。
+ */
+object PatchOverrideGenerator {
+
+    private const val IPCHANGE = "com/demo/hotfix/core/IpChange"
+    private const val PATCHES_LOADER = "com/demo/hotfix/core/PatchesLoader"
+    private const val LOADER_IMPL = "com/demo/patch/PatchesLoaderImpl"
+    private const val PATCH_PKG = "com/demo/patch"
+    private val OBJECT_T = Type.getType(Any::class.java)
+    private val STRING_T = Type.getType(String::class.java)
+    private val MAP_T = Type.getType("Ljava/util/Map;")
+    private val HASHMAP_T = Type.getType("Ljava/util/HashMap;")
+
+    fun generate(inDir: File, outDir: File, baseVersion: String, mappingFile: File?) {
+        val classes = inDir.walkTopDown()
+            .filter { it.isFile && it.extension == "class" }
+            .filter { !it.nameWithoutExtension.contains('$') }   // 跳过嵌套/合成类
+            .toList()
+        require(classes.isNotEmpty()) { "no .class found under $inDir" }
+
+        // mapping.txt 一次性解析成 orig(点分) -> obf(点分)；无 mapping(debug) 则为空表、查不到回退原名。
+        val classMapping = parseClassMapping(mappingFile)
+
+        // 运行时类名 -> 分发类内部名（供 PatchesLoaderImpl 装 Map）
+        val loaderEntries = LinkedHashMap<String, String>()
+        for (cf in classes) {
+            val cn = ClassNode().also { ClassReader(cf.readBytes()).accept(it, ClassReader.SKIP_FRAMES) }
+            if (cn.access and (Opcodes.ACC_INTERFACE or Opcodes.ACC_ANNOTATION) != 0) continue
+            val origDot = cn.name.replace('/', '.')
+            val runtimeName = classMapping[origDot] ?: origDot
+            val (dispName, bytes) = genDispatcher(cn, runtimeName)
+            write(outDir, dispName, bytes)
+            loaderEntries[runtimeName] = dispName
+            println("[PatchOverrideGenerator] ${cn.name} -> $dispName  (运行时 key=$runtimeName, ${bytes.size}B)")
+        }
+
+        val loaderBytes = genLoader(loaderEntries, baseVersion)
+        write(outDir, LOADER_IMPL, loaderBytes)
+        println("[PatchOverrideGenerator] $LOADER_IMPL  (baseVersion=$baseVersion, ${loaderEntries.size} 条映射)")
+    }
+
+    /**
+     * 解析 proguard/R8 mapping.txt 的**类重命名行** `com.demo.app.Calculator -> a.a:`。
+     * 只取顶格(列0)、以 `:` 结尾的类行；缩进的成员行(`    int f -> a`)与 `#` 注释行跳过。
+     */
+    private fun parseClassMapping(mappingFile: File?): Map<String, String> {
+        if (mappingFile == null || !mappingFile.isFile) return emptyMap()
+        val map = HashMap<String, String>()
+        for (line in mappingFile.readLines()) {
+            if (line.isEmpty() || line[0].isWhitespace() || line[0] == '#') continue
+            if (!line.endsWith(":")) continue
+            val arrow = line.indexOf(" -> ")
+            if (arrow < 0) continue
+            map[line.substring(0, arrow)] = line.substring(arrow + 4, line.length - 1)
+        }
+        return map
+    }
+
+    private fun write(outDir: File, internalName: String, bytes: ByteArray) {
+        val target = File(outDir, "$internalName.class")
+        target.parentFile.mkdirs()
+        target.writeBytes(bytes)
+    }
+
+    // 生成器 classpath 上没有 Calculator/IpChange 等类，帧计算需要的 common-super 找不到就回退 Object。
+    // ⚠️ 局限：若某方法体内**两个不相关引用类型在分支汇合处合并**，被强行归并成 Object 会算出错误的
+    //    StackMapTable -> 运行时 VerifyError。简单补丁(如 add，无此类合并)不触发；要彻底正确需把宿主/补丁
+    //    类喂给 ASM 的类型解析器(自定义 ClassLoader 或预扫描类层次)。本教学版未做。
+    private fun newWriter() = object : ClassWriter(COMPUTE_FRAMES) {
+        override fun getCommonSuperClass(a: String, b: String): String {
+            if (a == b) return a
+            return try { super.getCommonSuperClass(a, b) } catch (t: Throwable) { "java/lang/Object" }
+        }
+    }
+
+    private fun emitDefaultCtor(cw: ClassWriter) {
+        cw.visitMethod(Opcodes.ACC_PUBLIC, "<init>", "()V", null, null).apply {
+            visitCode()
+            visitVarInsn(Opcodes.ALOAD, 0)
+            visitMethodInsn(Opcodes.INVOKESPECIAL, "java/lang/Object", "<init>", "()V", false)
+            visitInsn(Opcodes.RETURN)
+            visitMaxs(0, 0)
+            visitEnd()
+        }
+    }
+
+    // 普通 class（非 data class）：含 Array<Type> 字段，且只按字段读取、从不比较，无需 equals/hashCode。
+    private class Entry(val methodId: String, val trampName: String, val trampDesc: String, val trampArgs: Array<Type>, val ret: Type)
+
+    /**
+     * 为单个被修类生成分发类 com/demo/patch/<Simple>Patch。
+     * @param runtimeDotName 该类在**运行时宿主**里的类名（release 为 R8 混淆名，如 a.a；debug 为原名）。
+     *   跳板首参(self)类型与 ipcDispatch 里的 checkcast 必须用这个名字 —— 宿主传进来的 args[0] 是混淆类的实例，
+     *   若仍用原始名 com/demo/app/Calculator，release 下该类已不存在 -> NoClassDefFoundError。
+     */
+    private fun genDispatcher(cn: ClassNode, runtimeDotName: String): Pair<String, ByteArray> {
+        val origInternal = cn.name                               // com/demo/app/Calculator —— 仅用于 methodId
+        val ownerInternal = runtimeDotName.replace('.', '/')     // 运行时(混淆)内部名，如 a/a
+        val ownerType = Type.getObjectType(ownerInternal)
+        val simple = origInternal.substringAfterLast('/')
+        val dispName = "$PATCH_PKG/${simple}Patch"               // com/demo/patch/CalculatorPatch
+        val dispType = Type.getObjectType(dispName)
+
+        val cw = newWriter()
+        cw.visit(Opcodes.V1_8, Opcodes.ACC_PUBLIC or Opcodes.ACC_SUPER, dispName, null, "java/lang/Object", arrayOf(IPCHANGE))
+        emitDefaultCtor(cw)
+
+        val skip = Opcodes.ACC_ABSTRACT or Opcodes.ACC_NATIVE or Opcodes.ACC_SYNTHETIC or Opcodes.ACC_BRIDGE
+        val entries = ArrayList<Entry>()
+        var idx = 0
+        for (m in cn.methods) {
+            if (m.name == "<init>" || m.name == "<clinit>") continue
+            if (m.access and skip != 0) continue
+            val isStatic = m.access and Opcodes.ACC_STATIC != 0
+            val origArgs = Type.getArgumentTypes(m.desc)
+            val ret = Type.getReturnType(m.desc)
+            // 实例方法：前插 owner 作首参(self)；原 slot0=this，转 static 后 slot0=self，槽位不变，方法体原样复用。
+            val trampArgs = if (isStatic) origArgs else arrayOf(ownerType, *origArgs)
+            val trampDesc = Type.getMethodDescriptor(ret, *trampArgs)
+            val trampName = "_p$idx"
+
+            val mn = MethodNode(Opcodes.ACC_PUBLIC or Opcodes.ACC_STATIC, trampName, trampDesc, null, m.exceptions?.toTypedArray())
+            mn.instructions = m.instructions          // 只搬方法体，丢弃调试信息(参数表/局部变量表)避免 self 首参错位
+            mn.tryCatchBlocks = m.tryCatchBlocks
+            // 不拷 maxStack/maxLocals：COMPUTE_FRAMES 会连 maxs 一起重算，传什么都被忽略。
+            mn.accept(cw)
+
+            // methodId 用**原始**类名 —— 与 HotfixMethodVisitor 烤进宿主方法头的字符串常量对齐(R8 不改字符串)。
+            entries += Entry(methodId(origInternal, m.name, m.desc), trampName, trampDesc, trampArgs, ret)
+            idx++
+        }
+
+        // ipcDispatch(String methodId, Object[] args): Object —— if-链命中后从 args[] 拆箱调跳板、装箱返回
+        val ga = GeneratorAdapter(Opcodes.ACC_PUBLIC, AsmMethod("ipcDispatch", "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/Object;"), null, null, cw)
+        for (e in entries) {
+            val next = ga.newLabel()
+            ga.loadArg(0)
+            ga.push(e.methodId)
+            ga.invokeVirtual(STRING_T, AsmMethod("equals", "(Ljava/lang/Object;)Z"))
+            ga.ifZCmp(GeneratorAdapter.EQ, next)
+            e.trampArgs.forEachIndexed { i, t ->
+                ga.loadArg(1)
+                ga.push(i)
+                ga.arrayLoad(OBJECT_T)
+                ga.unbox(t)
+            }
+            ga.invokeStatic(dispType, AsmMethod(e.trampName, e.trampDesc))
+            if (e.ret.sort == Type.VOID) ga.visitInsn(Opcodes.ACONST_NULL) else ga.box(e.ret)
+            ga.returnValue()
+            ga.mark(next)
+        }
+        ga.throwException(Type.getType(IllegalStateException::class.java), "unknown method")
+        ga.endMethod()
+
+        cw.visitEnd()
+        return dispName to cw.toByteArray()
+    }
+
+    /** 生成 PatchesLoaderImpl：load() 返回 HashMap{运行时名 -> new <X>Patch()}；baseVersion() 返回常量。 */
+    private fun genLoader(entries: Map<String, String>, baseVersion: String): ByteArray {
+        val cw = newWriter()
+        cw.visit(Opcodes.V1_8, Opcodes.ACC_PUBLIC or Opcodes.ACC_SUPER, LOADER_IMPL, null, "java/lang/Object", arrayOf(PATCHES_LOADER))
+        emitDefaultCtor(cw)
+
+        // load()Ljava/util/Map;
+        val gl = GeneratorAdapter(Opcodes.ACC_PUBLIC, AsmMethod("load", "()Ljava/util/Map;"), null, null, cw)
+        gl.newInstance(HASHMAP_T)
+        gl.dup()
+        gl.invokeConstructor(HASHMAP_T, AsmMethod("<init>", "()V"))
+        val map = gl.newLocal(MAP_T)
+        gl.storeLocal(map)
+        for ((runtimeName, dispInternal) in entries) {
+            val dispType = Type.getObjectType(dispInternal)
+            gl.loadLocal(map)
+            gl.push(runtimeName)
+            gl.newInstance(dispType)
+            gl.dup()
+            gl.invokeConstructor(dispType, AsmMethod("<init>", "()V"))
+            gl.invokeInterface(MAP_T, AsmMethod("put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"))
+            gl.pop()
+        }
+        gl.loadLocal(map)
+        gl.returnValue()
+        gl.endMethod()
+
+        // baseVersion()Ljava/lang/String;
+        val gv = GeneratorAdapter(Opcodes.ACC_PUBLIC, AsmMethod("baseVersion", "()Ljava/lang/String;"), null, null, cw)
+        gv.push(baseVersion)
+        gv.returnValue()
+        gv.endMethod()
+
+        cw.visitEnd()
+        return cw.toByteArray()
+    }
+}

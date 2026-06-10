@@ -1,0 +1,28 @@
+plugins {
+    id 'java-gradle-plugin'
+    id 'org.jetbrains.kotlin.jvm' version '1.9.24'
+}
+
+kotlin {
+    jvmToolchain(17)
+}
+
+dependencies {
+    compileOnly 'com.android.tools.build:gradle-api:8.6.0'
+    implementation 'org.ow2.asm:asm:9.7'
+    implementation 'org.ow2.asm:asm-commons:9.7'
+    implementation 'org.ow2.asm:asm-tree:9.7'   // ClassNode/MethodNode：把修好的原方法体拷进生成的补丁分发类
+}
+
+gradlePlugin {
+    plugins {
+        hotfixInstrument {
+            id = 'com.demo.hotfix.instrument'
+            implementationClass = 'com.demo.hotfix.plugin.HotfixPlugin'
+        }
+        hotfixPatch {
+            id = 'com.demo.hotfix.patch'
+            implementationClass = 'com.demo.hotfix.plugin.HotfixPatchPlugin'
+        }
+    }
+}

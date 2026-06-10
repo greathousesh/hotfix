@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">MiniHotfix Demo</string>
+    <!-- 资源补丁后的新文案 -->
+    <string name="patch_text">★ 已通过资源热修复更新 v1.1</string>
+</resources>

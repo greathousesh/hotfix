@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:orientation="vertical"
+    android:paddingTop="160dp"
+    android:layout_centerHorizontal="true"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <Button android:id="@+id/btn_java"   android:layout_width="match_parent" android:layout_height="wrap_content" android:text="测试 Java（add）"/>
+    <Button android:id="@+id/btn_res"    android:layout_width="match_parent" android:layout_height="wrap_content" android:text="测试 资源（string）"/>
+    <Button android:id="@+id/btn_native" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="测试 Native（nativeAdd）"/>
+    <Button android:id="@+id/btn_patch"  android:layout_width="match_parent" android:layout_height="wrap_content" android:text="★ 应用补丁"/>
+
+    <TextView android:id="@+id/tv_result"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:layout_marginTop="12dp"
+        android:textSize="14sp"
+        android:text="点击按钮查看结果"/>
+</LinearLayout>
