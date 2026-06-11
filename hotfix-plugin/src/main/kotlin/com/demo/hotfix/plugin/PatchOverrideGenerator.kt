@@ -149,7 +149,7 @@ object PatchOverrideGenerator {
         cw.visit(Opcodes.V1_8, Opcodes.ACC_PUBLIC or Opcodes.ACC_SUPER, dispName, null, "java/lang/Object", arrayOf(config.ipChange))
         emitDefaultCtor(cw)
 
-        val entries = emitTrampolines(cn, ownerInternal, origInternal, dispName, cw)
+        val entries = emitTrampolines(cn, ownerInternal, origInternal, cw)
         emitDispatchIndex(entries, dispType, cw)
         emitIpcDispatch(entries, dispType, cw)
 
@@ -162,7 +162,6 @@ object PatchOverrideGenerator {
         cn: ClassNode,
         ownerInternal: String,
         origInternal: String,
-        dispName: String,
         cw: ClassWriter,
     ): List<Entry> {
         val ownerType = Type.getObjectType(ownerInternal)

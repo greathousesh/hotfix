@@ -5,9 +5,9 @@ plugins {
 }
 
 android {
-    namespace 'com.demo.app'
+    namespace = 'com.demo.app'
     compileSdk 35
-    ndkVersion '28.1.13356709'   // 固定到有效 NDK（AGP 默认的 26.1 在本机损坏）
+    ndkVersion = '28.1.13356709'   // 固定到有效 NDK（AGP 默认的 26.1 在本机损坏）
 
     defaultConfig {
         applicationId 'com.demo.app'
@@ -19,9 +19,9 @@ android {
         externalNativeBuild { cmake { arguments "-DANDROID_STL=none" } }
     }
     externalNativeBuild {
-        cmake { path "src/main/cpp/CMakeLists.txt"; version "3.22.1" }
+        cmake { path = file("src/main/cpp/CMakeLists.txt"); version = "3.22.1" }
     }
-    buildFeatures { buildConfig true }
+    buildFeatures { buildConfig = true }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
@@ -36,7 +36,7 @@ android {
         release {
             minifyEnabled true
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
-            signingConfig signingConfigs.debug
+            signingConfig = signingConfigs.debug
         }
     }
 }

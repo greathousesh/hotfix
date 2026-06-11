@@ -4,9 +4,9 @@ plugins {
 }
 
 android {
-    namespace 'com.demo.hotfix'
+    namespace = 'com.demo.hotfix'
     compileSdk 35
-    ndkVersion '28.1.13356709'   // 固定到有效 NDK（AGP 默认的 26.1 在本机损坏）
+    ndkVersion = '28.1.13356709'   // 固定到有效 NDK（AGP 默认的 26.1 在本机损坏）
 
     defaultConfig {
         minSdk 24
@@ -19,8 +19,8 @@ android {
     }
     externalNativeBuild {
         cmake {
-            path "src/main/cpp/CMakeLists.txt"
-            version "3.22.1"
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
         }
     }
     compileOptions {

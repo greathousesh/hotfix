@@ -79,15 +79,9 @@ object ResourcePatcher {
             for (resRef in collectResourceReferences()) {
                 val res = resRef() ?: continue
                 if (replaceAssetManager(res, newAssets)) resCount++
-                runCatching { res.updateConfiguration(res.configuration, res.displayMetrics) }
             }
             // 兜底：Application 自己的 Resources
-            runCatching {
-                replaceAssetManager(app.resources, newAssets)
-                app.resources.updateConfiguration(
-                    app.resources.configuration, app.resources.displayMetrics
-                )
-            }
+            runCatching { replaceAssetManager(app.resources, newAssets) }
             Log.i(TAG, "resource patch applied: impls=$implCount res=$resCount path=$patchResPath")
             implCount > 0 || resCount > 0
         } catch (t: Throwable) {

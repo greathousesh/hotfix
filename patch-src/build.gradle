@@ -14,7 +14,7 @@ plugins {
 }
 
 android {
-    namespace 'com.demo.patch'
+    namespace = 'com.demo.patch'
     compileSdk 35
 
     defaultConfig {
