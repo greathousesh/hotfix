@@ -65,24 +65,48 @@ object Hotfix {
     fun installJavaPatch(input: InputStream): Boolean {
         ensureInit()
         warnIfMainThread("installJavaPatch")
-        val dex = store.saveJava(input)
-        return onMain { JavaPatcher.apply(app, dex.absolutePath, baseVersion, loaderClass) }
+        val dex = store.savePendingJava(input)
+        return try {
+            val ok = onMain { JavaPatcher.apply(app, dex.absolutePath, baseVersion, loaderClass) }
+            if (ok) store.commitJava() else store.discardPendingJava()
+            ok
+        } catch (t: Throwable) {
+            store.discardPendingJava()
+            Log.e(TAG, "install java patch failed", t)
+            false
+        }
     }
 
     /** 安装资源补丁：保存 apk 到 SDK 路径 + 立即换资源（MonkeyPatcher 式 AssetManager 替换）。 */
     fun installResourcePatch(input: InputStream): Boolean {
         ensureInit()
         warnIfMainThread("installResourcePatch")
-        val apk = store.saveResource(input)
-        return onMain { ResourcePatcher.apply(app, apk.absolutePath) }
+        val apk = store.savePendingResource(input)
+        return try {
+            val ok = onMain { ResourcePatcher.apply(app, apk.absolutePath) }
+            if (ok) store.commitResource() else store.discardPendingResource()
+            ok
+        } catch (t: Throwable) {
+            store.discardPendingResource()
+            Log.e(TAG, "install resource patch failed", t)
+            false
+        }
     }
 
     /** 安装 Native 补丁：保存 so + 记录 hook 规格 + 立即内联 hook。hook 规格也被持久化供冷启动续用。 */
     fun installNativePatch(input: InputStream, hooks: List<NativeHook>): Boolean {
         ensureInit()
         warnIfMainThread("installNativePatch")
-        val so = store.saveNative(input, hooks)
-        return onMain { applyNative(so.absolutePath, hooks) }
+        val so = store.savePendingNative(input, hooks)
+        return try {
+            val ok = onMain { applyNative(so.absolutePath, hooks) }
+            if (ok) store.commitNative() else store.discardPendingNative()
+            ok
+        } catch (t: Throwable) {
+            store.discardPendingNative()
+            Log.e(TAG, "install native patch failed", t)
+            false
+        }
     }
 
     private fun ensureInit() =
@@ -108,15 +132,24 @@ object Hotfix {
     private fun applyPersisted() {
         store.javaPatch()?.let {
             Log.i(TAG, "auto-apply persisted java patch")
-            JavaPatcher.apply(app, it.absolutePath, baseVersion, loaderClass)
+            if (!JavaPatcher.apply(app, it.absolutePath, baseVersion, loaderClass)) {
+                Log.e(TAG, "disable persisted java patch after apply failure")
+                store.disableJava()
+            }
         }
         store.resourcePatch()?.let {
             Log.i(TAG, "auto-apply persisted resource patch")
-            ResourcePatcher.apply(app, it.absolutePath)   // 主线程，与 init() 调用链一致
+            if (!ResourcePatcher.apply(app, it.absolutePath)) {
+                Log.e(TAG, "disable persisted resource patch after apply failure")
+                store.disableResource()
+            }
         }
         store.nativePatch()?.let { (so, hooks) ->
             Log.i(TAG, "auto-apply persisted native patch")
-            applyNative(so.absolutePath, hooks)
+            if (!applyNative(so.absolutePath, hooks)) {
+                Log.e(TAG, "disable persisted native patch after apply failure")
+                store.disableNative()
+            }
         }
     }
 

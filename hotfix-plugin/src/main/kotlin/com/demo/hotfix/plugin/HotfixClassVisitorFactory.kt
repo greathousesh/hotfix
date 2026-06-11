@@ -21,7 +21,7 @@ abstract class HotfixClassVisitorFactory :
         val pkgs = parameters.get().instrumentPackages.get()
         if (pkgs.isEmpty()) return false
         val name = classData.className
-        if (!pkgs.any { name.startsWith(it) }) return false
+        if (!pkgs.any { name == it || name.startsWith("$it.") }) return false
         if (name.endsWith(".R") || name.contains(".R$") || name.endsWith(".BuildConfig")) return false
         return true
     }
