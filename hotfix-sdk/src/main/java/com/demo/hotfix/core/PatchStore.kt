@@ -4,6 +4,7 @@ import android.content.Context
 import com.demo.hotfix.NativeHook
 import java.io.File
 import java.io.InputStream
+import java.io.RandomAccessFile
 
 /**
  * 补丁持久化：SDK 自行决定保存路径，对外只收数据流。
@@ -18,6 +19,7 @@ internal class PatchStore(ctx: Context) {
     private val legacyRes = File(dir, "patch_res.apk")
     private val legacySo = File(dir, "libpatch.so")
     private val legacyNativeSpec = File(dir, "native_hooks.txt")
+    private val lockFile = File(dir, "store.lock")
 
     private val javaStore = TypedStore("java")
     private val resourceStore = TypedStore("resource")
@@ -26,11 +28,17 @@ internal class PatchStore(ctx: Context) {
     fun savePendingJava(input: InputStream): File =
         write(input, javaStore.pendingFile("patch.dex"))
 
-    fun commitJava() = javaStore.promotePending()
+    fun commitJava() = withStoreLock { javaStore.promotePending() }
 
-    fun discardPendingJava() = javaStore.discardPending()
+    fun discardPendingJava() = withStoreLock { javaStore.discardPending() }
 
-    fun disableJava() {
+    fun beginJavaApply() = withStoreLock { javaStore.beginApply() }
+
+    fun finishJavaApply() = withStoreLock { javaStore.finishApply() }
+
+    fun hasStaleJavaApply(): Boolean = withStoreLock { javaStore.hasStaleApply() }
+
+    fun disableJava() = withStoreLock {
         javaStore.disableActive()
         legacyDex.delete()
     }
@@ -38,11 +46,17 @@ internal class PatchStore(ctx: Context) {
     fun savePendingResource(input: InputStream): File =
         write(input, resourceStore.pendingFile("patch_res.apk"))
 
-    fun commitResource() = resourceStore.promotePending()
+    fun commitResource() = withStoreLock { resourceStore.promotePending() }
 
-    fun discardPendingResource() = resourceStore.discardPending()
+    fun discardPendingResource() = withStoreLock { resourceStore.discardPending() }
 
-    fun disableResource() {
+    fun beginResourceApply() = withStoreLock { resourceStore.beginApply() }
+
+    fun finishResourceApply() = withStoreLock { resourceStore.finishApply() }
+
+    fun hasStaleResourceApply(): Boolean = withStoreLock { resourceStore.hasStaleApply() }
+
+    fun disableResource() = withStoreLock {
         resourceStore.disableActive()
         legacyRes.delete()
     }
@@ -57,29 +71,46 @@ internal class PatchStore(ctx: Context) {
         return so
     }
 
-    fun commitNative() = nativeStore.promotePending()
+    fun commitNative() = withStoreLock { nativeStore.promotePending() }
 
-    fun discardPendingNative() = nativeStore.discardPending()
+    fun discardPendingNative() = withStoreLock { nativeStore.discardPending() }
 
-    fun disableNative() {
+    fun beginNativeApply() = withStoreLock { nativeStore.beginApply() }
+
+    fun finishNativeApply() = withStoreLock { nativeStore.finishApply() }
+
+    fun hasStaleNativeApply(): Boolean = withStoreLock { nativeStore.hasStaleApply() }
+
+    fun disableNative() = withStoreLock {
         nativeStore.disableActive()
         legacySo.delete()
         legacyNativeSpec.delete()
     }
 
-    fun javaPatch(): File? =
+    fun javaPatch(): File? = withStoreLock {
         javaStore.activeFile("patch.dex").takeIf { it.exists() } ?: legacyDex.takeIf { it.exists() }
+    }
 
-    fun resourcePatch(): File? =
+    fun resourcePatch(): File? = withStoreLock {
         resourceStore.activeFile("patch_res.apk").takeIf { it.exists() } ?: legacyRes.takeIf { it.exists() }
+    }
 
-    fun nativePatch(): Pair<File, List<NativeHook>>? {
+    fun nativePatch(): Pair<File, List<NativeHook>>? = withStoreLock {
         val so = nativeStore.activeFile("libpatch.so").takeIf { it.exists() } ?: legacySo.takeIf { it.exists() }
         val spec = nativeStore.activeFile("native_hooks.txt").takeIf { it.exists() }
             ?: legacyNativeSpec.takeIf { it.exists() }
-        if (so == null || spec == null) return null
+        if (so == null || spec == null) return@withStoreLock null
         val hooks = readHooks(spec)
-        return if (hooks.isEmpty()) null else so to hooks
+        if (hooks.isEmpty()) null else so to hooks
+    }
+
+    private fun <T> withStoreLock(block: () -> T): T {
+        lockFile.parentFile?.mkdirs()
+        RandomAccessFile(lockFile, "rw").channel.use { channel ->
+            channel.lock().use {
+                return block()
+            }
+        }
     }
 
     private fun readHooks(spec: File): List<NativeHook> =
@@ -118,6 +149,7 @@ internal class PatchStore(ctx: Context) {
         private val active = File(root, "active")
         private val backup = File(root, "backup")
         private val disabled = File(root, "disabled")
+        private val applying = File(root, "applying")
 
         fun pendingFile(name: String): File = File(pending, name)
 
@@ -139,6 +171,7 @@ internal class PatchStore(ctx: Context) {
                 error("promote pending patch failed: $pending -> $active")
             }
             backup.deleteRecursively()
+            applying.delete()
         }
 
         fun disableActive() {
@@ -148,6 +181,20 @@ internal class PatchStore(ctx: Context) {
             }
             pending.deleteRecursively()
             backup.deleteRecursively()
+            applying.delete()
         }
+
+        fun beginApply() {
+            active.takeIf { it.exists() } ?: return
+            applying.parentFile?.mkdirs()
+            applying.writeText(System.currentTimeMillis().toString())
+        }
+
+        fun finishApply() {
+            applying.delete()
+        }
+
+        fun hasStaleApply(): Boolean =
+            applying.exists() && active.exists()
     }
 }

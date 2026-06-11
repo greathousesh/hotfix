@@ -130,23 +130,53 @@ object Hotfix {
      * 调用者（[init]）保证此方法运行在主线程，故 ResourcePatcher 可直接调用，无需 onMain。
      */
     private fun applyPersisted() {
+        if (store.hasStaleJavaApply()) {
+            Log.e(TAG, "disable persisted java patch after previous apply crash")
+            store.disableJava()
+        }
         store.javaPatch()?.let {
             Log.i(TAG, "auto-apply persisted java patch")
-            if (!JavaPatcher.apply(app, it.absolutePath, baseVersion, loaderClass)) {
+            store.beginJavaApply()
+            val ok = runCatching {
+                JavaPatcher.apply(app, it.absolutePath, baseVersion, loaderClass)
+            }.getOrDefault(false)
+            if (ok) {
+                store.finishJavaApply()
+            } else {
                 Log.e(TAG, "disable persisted java patch after apply failure")
                 store.disableJava()
             }
         }
+        if (store.hasStaleResourceApply()) {
+            Log.e(TAG, "disable persisted resource patch after previous apply crash")
+            store.disableResource()
+        }
         store.resourcePatch()?.let {
             Log.i(TAG, "auto-apply persisted resource patch")
-            if (!ResourcePatcher.apply(app, it.absolutePath)) {
+            store.beginResourceApply()
+            val ok = runCatching {
+                ResourcePatcher.apply(app, it.absolutePath)
+            }.getOrDefault(false)
+            if (ok) {
+                store.finishResourceApply()
+            } else {
                 Log.e(TAG, "disable persisted resource patch after apply failure")
                 store.disableResource()
             }
         }
+        if (store.hasStaleNativeApply()) {
+            Log.e(TAG, "disable persisted native patch after previous apply crash")
+            store.disableNative()
+        }
         store.nativePatch()?.let { (so, hooks) ->
             Log.i(TAG, "auto-apply persisted native patch")
-            if (!applyNative(so.absolutePath, hooks)) {
+            store.beginNativeApply()
+            val ok = runCatching {
+                applyNative(so.absolutePath, hooks)
+            }.getOrDefault(false)
+            if (ok) {
+                store.finishNativeApply()
+            } else {
                 Log.e(TAG, "disable persisted native patch after apply failure")
                 store.disableNative()
             }
