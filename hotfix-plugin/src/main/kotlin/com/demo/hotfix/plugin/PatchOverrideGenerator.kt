@@ -59,10 +59,14 @@ object PatchOverrideGenerator {
 
         // mapping.txt 一次性解析成 orig(点分) -> obf(点分)；无 mapping(debug) 则为空表、查不到回退原名。
         val classMapping = parseClassMapping(config.mappingFile)
-        // 非 synthetic 的非接口类均视为可热修类：覆盖顶层类、$Companion、命名内部类。
-        // 匿名类/lambda/WhenMappings 等编译器合成类带 ACC_SYNTHETIC，走 genHelper 路径。
+        // 可热修类判定：非 synthetic、非接口，且末段 $-segment 含非数字字符。
+        //   ACC_SYNTHETIC  → 过滤 Java 匿名类 / Kotlin lambda / WhenMappings 等编译器合成类
+        //   末段全数字      → 过滤 Kotlin object 表达式（如 Calculator$add$fixed$1）——
+        //                    这类类不带 ACC_SYNTHETIC，但末段固定是纯数字序号。
+        // 保留：顶层类（无 $）、$Companion、$DefaultImpls、命名内部类。
         val topClasses = classNodes.filter { cn ->
-            cn.access and (Opcodes.ACC_SYNTHETIC or Opcodes.ACC_INTERFACE or Opcodes.ACC_ANNOTATION) == 0
+            cn.access and (Opcodes.ACC_SYNTHETIC or Opcodes.ACC_INTERFACE or Opcodes.ACC_ANNOTATION) == 0 &&
+                cn.name.substringAfterLast('$').any { !it.isDigit() }
         }
         require(topClasses.isNotEmpty()) { "no patchable class found under $inDir" }
 
