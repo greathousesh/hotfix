@@ -15,38 +15,64 @@ import java.util.concurrent.CountDownLatch
  * 热修复 SDK 门面：Java/Kotlin 代码、资源、Native 三种能力收口。
  *
  * 对外只暴露**数据流**接口（`installXxxPatch(InputStream)`）：调用方只管把补丁字节流（本地文件/
- * 网络下载/任意来源）交进来，SDK 自己决定落盘路径(内部沙盒 [PatchStore])、立即应用、并持久化；
+ * 网络下载/任意来源）交进来，SDK 自己决定落盘路径（内部沙盒 [PatchStore]）、立即应用、并持久化；
  * 下次冷启动 [init] 时自动重新应用已安装的补丁。
  *
- * 线程模型：保存(可能是网络流的读取)在调用线程完成 —— 所以 install* 请在**后台线程**调用；
- * 真正的应用(反射热替换 / 资源 AssetManager 重建)统一 marshal 到**主线程**执行。
+ * ## 线程模型
+ * - [init] **必须**在主线程调用（Application/Activity.onCreate）。
+ * - `install*` 必须在**后台线程**调用：InputStream 读取（可能是网络流）在调用线程完成，
+ *   而真正的补丁应用（反射热替换 / AssetManager 重建）则 marshal 到主线程执行。
+ *   从主线程调用 `install*` 不会死锁，但 InputStream 读取会阻塞主线程，且主线程上直接
+ *   执行补丁应用会让所有 `onMain {}` 退化为同步串行，影响响应性。
  */
 object Hotfix {
 
     private const val TAG = "MiniHotfix"
 
+    @Volatile private var initialized = false
     private lateinit var app: Application
-    private var baseVersion: String = "unknown"
     private lateinit var store: PatchStore
+    private lateinit var baseVersion: String
+    private lateinit var loaderClass: String
 
-    /** 初始化；并自动应用已持久化的补丁（冷启动续用）。需在主线程调用（如 Activity/Application onCreate）。 */
-    fun init(app: Application, baseVersion: String) {
+    /**
+     * 初始化；并自动应用已持久化的补丁（冷启动续用）。
+     *
+     * **必须在主线程调用**（Application/Activity onCreate）。重复调用视为 no-op，不会重复初始化。
+     *
+     * @param loaderClass 补丁加载器类名，须与 hotfixPatch { loaderClass } 配置一致，
+     *                    默认 [JavaPatcher.DEFAULT_LOADER_CLASS]。
+     */
+    fun init(
+        app: Application,
+        baseVersion: String,
+        loaderClass: String = JavaPatcher.DEFAULT_LOADER_CLASS,
+    ) {
+        check(Looper.myLooper() == Looper.getMainLooper()) {
+            "Hotfix.init() must be called on the main thread"
+        }
+        if (initialized) return   // 防止重复 init 覆盖状态
         this.app = app
         this.baseVersion = baseVersion
+        this.loaderClass = loaderClass
         this.store = PatchStore(app)
+        initialized = true
+        // init 在主线程调用，applyPersisted 直接执行（ResourcePatcher 需要主线程）
         applyPersisted()
     }
 
     /** 安装代码补丁：保存 dex 到 SDK 路径 + 立即热修（InstantPatch 式 $ipChange 重定向）。 */
     fun installJavaPatch(input: InputStream): Boolean {
         ensureInit()
+        warnIfMainThread("installJavaPatch")
         val dex = store.saveJava(input)
-        return onMain { JavaPatcher.apply(app, dex.absolutePath, baseVersion) }
+        return onMain { JavaPatcher.apply(app, dex.absolutePath, baseVersion, loaderClass) }
     }
 
     /** 安装资源补丁：保存 apk 到 SDK 路径 + 立即换资源（MonkeyPatcher 式 AssetManager 替换）。 */
     fun installResourcePatch(input: InputStream): Boolean {
         ensureInit()
+        warnIfMainThread("installResourcePatch")
         val apk = store.saveResource(input)
         return onMain { ResourcePatcher.apply(app, apk.absolutePath) }
     }
@@ -54,12 +80,19 @@ object Hotfix {
     /** 安装 Native 补丁：保存 so + 记录 hook 规格 + 立即内联 hook。hook 规格也被持久化供冷启动续用。 */
     fun installNativePatch(input: InputStream, hooks: List<NativeHook>): Boolean {
         ensureInit()
+        warnIfMainThread("installNativePatch")
         val so = store.saveNative(input, hooks)
         return onMain { applyNative(so.absolutePath, hooks) }
     }
 
     private fun ensureInit() =
-        check(this::store.isInitialized) { "请先调用 Hotfix.init(app, baseVersion) 再安装补丁" }
+        check(initialized) { "请先调用 Hotfix.init(app, baseVersion) 再安装补丁" }
+
+    private fun warnIfMainThread(name: String) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            Log.w(TAG, "$name() called on main thread — move to a background thread to avoid blocking UI")
+        }
+    }
 
     private fun applyNative(soPath: String, hooks: List<NativeHook>): Boolean {
         if (hooks.isEmpty()) return false
@@ -68,15 +101,18 @@ object Hotfix {
         return ok
     }
 
-    /** 冷启动续用：把已持久化的补丁重新应用。运行在主线程、仅读本地文件（无网络）。 */
+    /**
+     * 冷启动续用：把已持久化的补丁重新应用。
+     * 调用者（[init]）保证此方法运行在主线程，故 ResourcePatcher 可直接调用，无需 onMain。
+     */
     private fun applyPersisted() {
         store.javaPatch()?.let {
             Log.i(TAG, "auto-apply persisted java patch")
-            JavaPatcher.apply(app, it.absolutePath, baseVersion)
+            JavaPatcher.apply(app, it.absolutePath, baseVersion, loaderClass)
         }
         store.resourcePatch()?.let {
             Log.i(TAG, "auto-apply persisted resource patch")
-            ResourcePatcher.apply(app, it.absolutePath)
+            ResourcePatcher.apply(app, it.absolutePath)   // 主线程，与 init() 调用链一致
         }
         store.nativePatch()?.let { (so, hooks) ->
             Log.i(TAG, "auto-apply persisted native patch")
@@ -84,7 +120,7 @@ object Hotfix {
         }
     }
 
-    /** 在主线程执行 block 并返回结果；已在主线程则直接执行。 */
+    /** 在主线程执行 block 并返回结果；已在主线程则直接执行（不 post，避免语义混乱）。 */
     private fun <T> onMain(block: () -> T): T {
         if (Looper.myLooper() == Looper.getMainLooper()) return block()
         val latch = CountDownLatch(1)

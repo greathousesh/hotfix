@@ -17,10 +17,15 @@ import java.io.File
 object JavaPatcher {
 
     private const val TAG = "MiniHotfix"
-    private const val LOADER_IMPL = "com.demo.patch.PatchesLoaderImpl"
+    const val DEFAULT_LOADER_CLASS = "com.demo.patch.PatchesLoaderImpl"
     const val INJECT_FIELD = "\$ipChange"   // "\$" -> 字面量 $ipChange，与 ASM 注入字段同名
 
-    fun apply(ctx: Context, patchDexPath: String, hostBaseVersion: String): Boolean {
+    fun apply(
+        ctx: Context,
+        patchDexPath: String,
+        hostBaseVersion: String,
+        loaderClass: String = DEFAULT_LOADER_CLASS,
+    ): Boolean {
         val dex = File(patchDexPath)
         if (!dex.exists()) {
             Log.e(TAG, "patch dex not found: $patchDexPath")
@@ -44,7 +49,7 @@ object JavaPatcher {
             val hostCl = JavaPatcher::class.java.classLoader
             val patchCl = DexClassLoader(dex.absolutePath, optDir.absolutePath, null, hostCl)
 
-            val loader = patchCl.loadClass(LOADER_IMPL)
+            val loader = patchCl.loadClass(loaderClass)
                 .getDeclaredConstructor().newInstance() as PatchesLoader
 
             if (hostBaseVersion != loader.baseVersion()) {

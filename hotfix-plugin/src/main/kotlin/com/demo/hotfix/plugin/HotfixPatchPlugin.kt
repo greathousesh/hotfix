@@ -36,8 +36,13 @@ import javax.inject.Inject
 class HotfixPatchPlugin : Plugin<Project> {
 
     override fun apply(project: Project) {
-        val baseVersion = "1.0.0"                 // 须与宿主 Hotfix.init(..., baseVersion) 一致
+        val ext = project.extensions.create("hotfixPatch", HotfixPatchExtension::class.java)
         val tk = Toolchain.resolve(project)
+
+        // baseVersion：优先用 extension 显式配置；否则从根项目 :app 的 versionName 自动读取。
+        val baseVersionProvider: org.gradle.api.provider.Provider<String> = project.provider {
+            ext.baseVersion ?: resolveAppVersionName(project)
+        }
 
         // native 补丁与变体无关，注册一次
         val nativeTask = project.tasks.register("compilePatchNative", NativeTask::class.java) {
@@ -66,7 +71,8 @@ class HotfixPatchPlugin : Plugin<Project> {
                 it.group = GROUP
                 it.dependsOn("compile${V}Kotlin")
                 it.classesDir.set(kotlinClasses)
-                it.baseVersion.set(baseVersion)
+                it.baseVersion.set(baseVersionProvider)
+                it.loaderClass.set(project.provider { ext.loaderClass })
                 // release 的 mapping.txt 由 :app 的 R8 产出 -> 显式依赖，否则 Gradle 报隐式依赖错
                 if (variant == "release") {
                     it.mappingFile.set(mapping)
@@ -103,7 +109,23 @@ class HotfixPatchPlugin : Plugin<Project> {
         }
     }
 
-    companion object { const val GROUP = "hotfix patch" }
+    companion object {
+        const val GROUP = "hotfix patch"
+
+        /** 从根项目 :app 的 AGP extension 读取 versionName，找不到时回退 "1.0.0"。 */
+        internal fun resolveAppVersionName(project: Project): String {
+            val appProject = project.rootProject.findProject(":app") ?: return "1.0.0"
+            return try {
+                // 避免硬依赖 AppExtension，用反射读取，以兼容不同 AGP 版本
+                val androidExt = appProject.extensions.findByName("android") ?: return "1.0.0"
+                val defaultConfig = androidExt.javaClass.getMethod("getDefaultConfig").invoke(androidExt)
+                defaultConfig.javaClass.getMethod("getVersionName").invoke(defaultConfig) as? String ?: "1.0.0"
+            } catch (t: Throwable) {
+                project.logger.warn("[HotfixPatchPlugin] 无法自动读取 versionName，回退到 1.0.0：${t.message}")
+                "1.0.0"
+            }
+        }
+    }
 }
 
 // ---------------- 工具链解析（SDK/build-tools/NDK/android.jar），不依赖 AGP 内部 API ----------------
@@ -158,13 +180,14 @@ abstract class GeneratePatchTask : DefaultTask() {
     @get:InputDirectory abstract val classesDir: DirectoryProperty
     @get:Optional @get:InputFile abstract val mappingFile: RegularFileProperty
     @get:Input abstract val baseVersion: Property<String>
+    @get:Input abstract val loaderClass: Property<String>
     @get:OutputDirectory abstract val outputDir: DirectoryProperty
 
     @TaskAction fun run() {
         val out = outputDir.get().asFile
         out.deleteRecursively(); out.mkdirs()
         val mf = mappingFile.orNull?.asFile?.takeIf { it.exists() }
-        PatchOverrideGenerator.generate(classesDir.get().asFile, out, baseVersion.get(), mf)
+        PatchOverrideGenerator.generate(classesDir.get().asFile, out, baseVersion.get(), mf, loaderClass.get())
     }
 }
 

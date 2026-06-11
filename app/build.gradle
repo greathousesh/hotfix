@@ -41,6 +41,10 @@ android {
     }
 }
 
+hotfix {
+    instrumentPackages = ['com.demo.app']
+}
+
 dependencies {
     implementation project(':hotfix-sdk')
     implementation 'org.jetbrains.kotlin:kotlin-stdlib:1.9.24'

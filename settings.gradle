@@ -11,6 +11,9 @@ pluginManagement {
         mavenCentral()
     }
 }
+plugins {
+    id 'org.gradle.toolchains.foojay-resolver-convention' version '0.10.0'
+}
 dependencyResolutionManagement {
     repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
     repositories {
@@ -24,4 +27,4 @@ dependencyResolutionManagement {
 rootProject.name = "HotfixDemo"
 include ':app'
 include ':hotfix-sdk'
-include ':patch-src'   // 仅 IDE 索引补丁源码；真正打补丁仍用 patch-src/build_patch.sh
+include ':patch-src'   // 补丁模块；./gradlew :patch-src:assemblePatch{Debug,Release} 产出补丁

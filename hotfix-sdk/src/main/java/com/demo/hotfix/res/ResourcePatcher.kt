@@ -5,6 +5,8 @@ import android.content.res.AssetManager
 import android.content.res.Resources
 import android.util.Log
 import java.lang.ref.Reference
+import java.lang.reflect.Field
+import java.lang.reflect.Method
 
 /**
  * 资源热修复（对应淘宝 MonkeyPatcher.monkeyPatchExistingResources）。
@@ -23,11 +25,29 @@ object ResourcePatcher {
 
     private const val TAG = "MiniHotfix"
 
+    // apply() 始终在主线程执行（由 Hotfix.onMain() 保证），无并发写入，lazy 安全。
+    private val addAssetPath: Method by lazy {
+        AssetManager::class.java.getDeclaredMethod("addAssetPath", String::class.java)
+            .apply { isAccessible = true }
+    }
+    private val ensureStringBlocks: Method? by lazy {
+        try { AssetManager::class.java.getDeclaredMethod("ensureStringBlocks").apply { isAccessible = true } }
+        catch (ignore: Throwable) { null }
+    }
+    private val cachedResourcesManager: Any? by lazy { resourcesManager() }
+    private val mResourcesImplField: Field? by lazy {
+        try { Resources::class.java.getDeclaredField("mResourcesImpl").apply { isAccessible = true } }
+        catch (ignore: Throwable) { null }
+    }
+    // 通用字段缓存：Class+名 -> Field；替代每次 getDeclaredField 的重复反射。
+    private val fieldCache = HashMap<Pair<Class<*>, String>, Field?>()
+    private fun cachedField(cls: Class<*>, name: String): Field? =
+        fieldCache.getOrPut(cls to name) {
+            try { cls.getDeclaredField(name).apply { isAccessible = true } } catch (ignore: Throwable) { null }
+        }
+
     fun apply(app: Application, patchResPath: String): Boolean {
         return try {
-            val addAssetPath = AssetManager::class.java
-                .getDeclaredMethod("addAssetPath", String::class.java)
-                .apply { isAccessible = true }
 
             // 1. 新 AssetManager：先补丁、后宿主原始路径。
             //    ★ 顺序关键（Android 7+ / AssetManager2）：补丁包与宿主同 package(com.demo.app, id 0x7f)，
@@ -48,10 +68,7 @@ object ResourcePatcher {
                 val c = addAssetPath.invoke(newAssets, p) as Int
                 Log.i(TAG, "addAssetPath host: $p -> cookie=$c")
             }
-            runCatching {
-                AssetManager::class.java.getDeclaredMethod("ensureStringBlocks")
-                    .apply { isAccessible = true }.invoke(newAssets)
-            }
+            runCatching { ensureStringBlocks?.invoke(newAssets) }
 
             // 2. 注入进程内所有 ResourcesImpl + Resources
             var implCount = 0
@@ -90,28 +107,20 @@ object ResourcePatcher {
     }
 
     /** 把 ResourcesImpl.mAssets 设为新 AssetManager。 */
-    private fun setImplAssets(impl: Any, newAssets: AssetManager): Boolean = try {
-        impl.javaClass.getDeclaredField("mAssets")
-            .apply { isAccessible = true }.set(impl, newAssets)
-        true
-    } catch (t: Throwable) {
-        false
+    private fun setImplAssets(impl: Any, newAssets: AssetManager): Boolean {
+        val f = cachedField(impl.javaClass, "mAssets") ?: return false
+        return try { f.set(impl, newAssets); true } catch (t: Throwable) { false }
     }
 
     /** N+：Resources -> mResourcesImpl -> mAssets；老版本：Resources.mAssets。 */
     private fun replaceAssetManager(res: Resources, newAssets: AssetManager): Boolean {
+        val impl = mResourcesImplField?.get(res)
+        if (impl != null) return setImplAssets(impl, newAssets)
         return try {
-            val impl = Resources::class.java.getDeclaredField("mResourcesImpl")
-                .apply { isAccessible = true }.get(res)!!
-            setImplAssets(impl, newAssets)
-        } catch (preN: NoSuchFieldException) {
-            try {
-                Resources::class.java.getDeclaredField("mAssets")
-                    .apply { isAccessible = true }.set(res, newAssets)
-                true
-            } catch (t: Throwable) {
-                false
-            }
+            cachedField(Resources::class.java, "mAssets")?.set(res, newAssets)
+            true
+        } catch (t: Throwable) {
+            false
         }
     }
 
@@ -120,8 +129,8 @@ object ResourcePatcher {
     private fun collectResourcesImpls(): List<Any> {
         val out = ArrayList<Any>()
         try {
-            val rm = resourcesManager() ?: return out
-            val f = rm.javaClass.getDeclaredField("mResourceImpls").apply { isAccessible = true }
+            val rm = cachedResourcesManager ?: return out
+            val f = cachedField(rm.javaClass, "mResourceImpls") ?: return out
             when (val impls = f.get(rm)) {
                 is Map<*, *> -> impls.values.forEach { o ->
                     (o as? Reference<*>)?.get()?.let { out.add(it) }
@@ -136,12 +145,10 @@ object ResourcePatcher {
     @Suppress("UNCHECKED_CAST")
     private fun collectResourceReferences(): List<() -> Resources?> {
         val out = ArrayList<() -> Resources?>()
-        val rm = resourcesManager() ?: return out
-        val refField = try {
-            rm.javaClass.getDeclaredField("mResourceReferences")
-        } catch (e: NoSuchFieldException) {
-            rm.javaClass.getDeclaredField("mActiveResources")
-        }.apply { isAccessible = true }
+        val rm = cachedResourcesManager ?: return out
+        val refField = cachedField(rm.javaClass, "mResourceReferences")
+            ?: cachedField(rm.javaClass, "mActiveResources")
+            ?: return out
 
         when (val refs = refField.get(rm)) {
             is Collection<*> -> refs.forEach { o ->

@@ -31,14 +31,18 @@ object PatchOverrideGenerator {
 
     private const val IPCHANGE = "com/demo/hotfix/core/IpChange"
     private const val PATCHES_LOADER = "com/demo/hotfix/core/PatchesLoader"
-    private const val LOADER_IMPL = "com/demo/patch/PatchesLoaderImpl"
-    private const val PATCH_PKG = "com/demo/patch"
     private val OBJECT_T = Type.getType(Any::class.java)
     private val STRING_T = Type.getType(String::class.java)
     private val MAP_T = Type.getType("Ljava/util/Map;")
     private val HASHMAP_T = Type.getType("Ljava/util/HashMap;")
 
-    fun generate(inDir: File, outDir: File, baseVersion: String, mappingFile: File?) {
+    fun generate(
+        inDir: File,
+        outDir: File,
+        baseVersion: String,
+        mappingFile: File?,
+        loaderClass: String = HotfixPatchExtension.DEFAULT_LOADER_CLASS,
+    ) {
         val classes = inDir.walkTopDown()
             .filter { it.isFile && it.extension == "class" }
             .filter { !it.nameWithoutExtension.contains('$') }   // 跳过嵌套/合成类
@@ -48,6 +52,9 @@ object PatchOverrideGenerator {
         // mapping.txt 一次性解析成 orig(点分) -> obf(点分)；无 mapping(debug) 则为空表、查不到回退原名。
         val classMapping = parseClassMapping(mappingFile)
 
+        val loaderInternal = loaderClass.replace('.', '/')
+        val patchPkg = loaderInternal.substringBeforeLast('/')
+
         // 运行时类名 -> 分发类内部名（供 PatchesLoaderImpl 装 Map）
         val loaderEntries = LinkedHashMap<String, String>()
         for (cf in classes) {
@@ -55,15 +62,15 @@ object PatchOverrideGenerator {
             if (cn.access and (Opcodes.ACC_INTERFACE or Opcodes.ACC_ANNOTATION) != 0) continue
             val origDot = cn.name.replace('/', '.')
             val runtimeName = classMapping[origDot] ?: origDot
-            val (dispName, bytes) = genDispatcher(cn, runtimeName)
+            val (dispName, bytes) = genDispatcher(cn, runtimeName, patchPkg)
             write(outDir, dispName, bytes)
             loaderEntries[runtimeName] = dispName
             println("[PatchOverrideGenerator] ${cn.name} -> $dispName  (运行时 key=$runtimeName, ${bytes.size}B)")
         }
 
-        val loaderBytes = genLoader(loaderEntries, baseVersion)
-        write(outDir, LOADER_IMPL, loaderBytes)
-        println("[PatchOverrideGenerator] $LOADER_IMPL  (baseVersion=$baseVersion, ${loaderEntries.size} 条映射)")
+        val loaderBytes = genLoader(loaderEntries, baseVersion, loaderInternal)
+        write(outDir, loaderInternal, loaderBytes)
+        println("[PatchOverrideGenerator] $loaderInternal  (baseVersion=$baseVersion, ${loaderEntries.size} 条映射)")
     }
 
     /**
@@ -115,17 +122,18 @@ object PatchOverrideGenerator {
     private class Entry(val methodId: String, val trampName: String, val trampDesc: String, val trampArgs: Array<Type>, val ret: Type)
 
     /**
-     * 为单个被修类生成分发类 com/demo/patch/<Simple>Patch。
+     * 为单个被修类生成分发类 <patchPkg>/<Simple>Patch。
      * @param runtimeDotName 该类在**运行时宿主**里的类名（release 为 R8 混淆名，如 a.a；debug 为原名）。
      *   跳板首参(self)类型与 ipcDispatch 里的 checkcast 必须用这个名字 —— 宿主传进来的 args[0] 是混淆类的实例，
      *   若仍用原始名 com/demo/app/Calculator，release 下该类已不存在 -> NoClassDefFoundError。
+     * @param patchPkg 补丁类所在包的内部名（如 com/demo/patch），与 loaderClass 同包。
      */
-    private fun genDispatcher(cn: ClassNode, runtimeDotName: String): Pair<String, ByteArray> {
+    private fun genDispatcher(cn: ClassNode, runtimeDotName: String, patchPkg: String): Pair<String, ByteArray> {
         val origInternal = cn.name                               // com/demo/app/Calculator —— 仅用于 methodId
         val ownerInternal = runtimeDotName.replace('.', '/')     // 运行时(混淆)内部名，如 a/a
         val ownerType = Type.getObjectType(ownerInternal)
         val simple = origInternal.substringAfterLast('/')
-        val dispName = "$PATCH_PKG/${simple}Patch"               // com/demo/patch/CalculatorPatch
+        val dispName = "$patchPkg/${simple}Patch"                // com/demo/patch/CalculatorPatch
         val dispType = Type.getObjectType(dispName)
 
         val cw = newWriter()
@@ -157,26 +165,78 @@ object PatchOverrideGenerator {
             idx++
         }
 
-        // ipcDispatch(String methodId, Object[] args): Object —— if-链命中后从 args[] 拆箱调跳板、装箱返回
-        val ga = GeneratorAdapter(Opcodes.ACC_PUBLIC, AsmMethod("ipcDispatch", "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/Object;"), null, null, cw)
-        for (e in entries) {
-            val next = ga.newLabel()
-            ga.loadArg(0)
-            ga.push(e.methodId)
-            ga.invokeVirtual(STRING_T, AsmMethod("equals", "(Ljava/lang/Object;)Z"))
-            ga.ifZCmp(GeneratorAdapter.EQ, next)
-            e.trampArgs.forEachIndexed { i, t ->
-                ga.loadArg(1)
-                ga.push(i)
-                ga.arrayLoad(OBJECT_T)
-                ga.unbox(t)
-            }
-            ga.invokeStatic(dispType, AsmMethod(e.trampName, e.trampDesc))
-            if (e.ret.sort == Type.VOID) ga.visitInsn(Opcodes.ACONST_NULL) else ga.box(e.ret)
-            ga.returnValue()
-            ga.mark(next)
+        // 静态字段 DISPATCH_IDX: Map<String, Integer>（methodId -> 整数索引）
+        cw.visitField(
+            Opcodes.ACC_PRIVATE or Opcodes.ACC_STATIC or Opcodes.ACC_FINAL,
+            "DISPATCH_IDX", "Ljava/util/Map;",
+            "Ljava/util/Map<Ljava/lang/String;Ljava/lang/Integer;>;", null
+        )?.visitEnd()
+
+        // <clinit>：初始化 DISPATCH_IDX —— 类加载时执行一次，后续每次 ipcDispatch 都是 O(1)
+        val si = GeneratorAdapter(Opcodes.ACC_STATIC, AsmMethod("<clinit>", "()V"), null, null, cw)
+        si.newInstance(HASHMAP_T)
+        si.dup()
+        si.invokeConstructor(HASHMAP_T, AsmMethod("<init>", "()V"))
+        si.putStatic(dispType, "DISPATCH_IDX", MAP_T)
+        for ((idx, e) in entries.withIndex()) {
+            si.getStatic(dispType, "DISPATCH_IDX", MAP_T)
+            si.push(e.methodId)
+            si.push(idx)
+            si.box(Type.INT_TYPE)   // Integer.valueOf(idx)
+            si.invokeInterface(MAP_T, AsmMethod("put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"))
+            si.pop()
         }
-        ga.throwException(Type.getType(IllegalStateException::class.java), "unknown method")
+        si.returnValue()
+        si.endMethod()
+
+        // ipcDispatch：HashMap.get(methodId) -> Integer -> tableswitch -> 拆箱调跳板 -> 装箱返回
+        val integerType = Type.getType(Integer::class.java)
+        val ga = GeneratorAdapter(Opcodes.ACC_PUBLIC, AsmMethod("ipcDispatch", "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/Object;"), null, null, cw)
+        if (entries.isEmpty()) {
+            ga.throwException(Type.getType(IllegalStateException::class.java), "unknown method")
+        } else {
+            val nullBranch = ga.newLabel()      // methodId 不在表中时的 pop+throw
+            val defaultBranch = ga.newLabel()   // tableswitch default（理论上不可达）
+
+            // Integer i = DISPATCH_IDX.get(methodId)
+            ga.getStatic(dispType, "DISPATCH_IDX", MAP_T)
+            ga.loadArg(0)
+            ga.invokeInterface(MAP_T, AsmMethod("get", "(Ljava/lang/Object;)Ljava/lang/Object;"))
+
+            // if (i == null) goto nullBranch（dup 保留栈顶供 nullBranch 的 pop 使用）
+            ga.dup()
+            ga.ifNull(nullBranch)
+
+            // int idx = ((Integer) i).intValue()
+            ga.checkCast(integerType)
+            ga.invokeVirtual(integerType, AsmMethod("intValue", "()I"))
+
+            // tableswitch 0..n-1，default -> defaultBranch
+            val caseLabels = Array(entries.size) { ga.newLabel() }
+            ga.visitTableSwitchInsn(0, entries.size - 1, defaultBranch, *caseLabels)
+
+            for ((ci, e) in entries.withIndex()) {
+                ga.mark(caseLabels[ci])
+                e.trampArgs.forEachIndexed { i, t ->
+                    ga.loadArg(1)
+                    ga.push(i)
+                    ga.arrayLoad(OBJECT_T)
+                    ga.unbox(t)
+                }
+                ga.invokeStatic(dispType, AsmMethod(e.trampName, e.trampDesc))
+                if (e.ret.sort == Type.VOID) ga.visitInsn(Opcodes.ACONST_NULL) else ga.box(e.ret)
+                ga.returnValue()
+            }
+
+            // null 分支：弹掉栈顶 null 再抛
+            ga.mark(nullBranch)
+            ga.pop()
+            ga.throwException(Type.getType(IllegalStateException::class.java), "unknown method")
+
+            // default 分支（理论上不可达，防御用）
+            ga.mark(defaultBranch)
+            ga.throwException(Type.getType(IllegalStateException::class.java), "unknown method")
+        }
         ga.endMethod()
 
         cw.visitEnd()
@@ -184,9 +244,9 @@ object PatchOverrideGenerator {
     }
 
     /** 生成 PatchesLoaderImpl：load() 返回 HashMap{运行时名 -> new <X>Patch()}；baseVersion() 返回常量。 */
-    private fun genLoader(entries: Map<String, String>, baseVersion: String): ByteArray {
+    private fun genLoader(entries: Map<String, String>, baseVersion: String, loaderInternal: String): ByteArray {
         val cw = newWriter()
-        cw.visit(Opcodes.V1_8, Opcodes.ACC_PUBLIC or Opcodes.ACC_SUPER, LOADER_IMPL, null, "java/lang/Object", arrayOf(PATCHES_LOADER))
+        cw.visit(Opcodes.V1_8, Opcodes.ACC_PUBLIC or Opcodes.ACC_SUPER, loaderInternal, null, "java/lang/Object", arrayOf(PATCHES_LOADER))
         emitDefaultCtor(cw)
 
         // load()Ljava/util/Map;

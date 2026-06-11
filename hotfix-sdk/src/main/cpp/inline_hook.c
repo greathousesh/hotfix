@@ -20,6 +20,7 @@
 #include <inttypes.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <pthread.h>
 #include <android/log.h>
 
 #ifndef MAP_FIXED_NOREPLACE
@@ -31,8 +32,23 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 
 #ifdef __aarch64__
-#define B_RANGE  (128 * 1024 * 1024)   // arm64 直接分支 B 的可达范围 ±128MB
-#define NEAR_WIN (124 * 1024 * 1024)   // 找空闲页时留点余量，保证落在 B 范围内
+#define B_RANGE   (128 * 1024 * 1024)   // arm64 直接分支 B 的可达范围 ±128MB
+#define NEAR_WIN  (124 * 1024 * 1024)   // 找空闲页时留点余量，保证落在 B 范围内
+#define MAX_HOOKS 64
+
+// 已 hook 函数的登记表：复用 trampoline 页，避免反复 mmap。
+// 注意：更新 trampoline 时存在极短暂的 PROT_READ|PROT_WRITE 窗口，多线程环境下若恰好
+// 有线程执行到目标函数入口并跳入 trampoline，会触发不可执行页异常（demo 下概率极低可接受）。
+typedef struct { uintptr_t target; uint32_t *tramp; } HookEntry;
+static HookEntry g_hooks[MAX_HOOKS];
+static int g_hook_count = 0;
+static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static uint32_t *find_tramp(uintptr_t target) {
+    for (int i = 0; i < g_hook_count; i++)
+        if (g_hooks[i].target == target) return g_hooks[i].tramp;
+    return NULL;
+}
 
 // 扫 /proc/self/maps，在 [target-NEAR_WIN, target+NEAR_WIN] 内找一页空闲虚拟地址给 trampoline。
 // 选离 target 最近的空隙，再用 MAP_FIXED_NOREPLACE 精确占位(不会覆盖已有映射)。
@@ -76,36 +92,67 @@ static int do_inline_hook(void *target, void *patch) {
     const size_t page = (size_t) sysconf(_SC_PAGESIZE);
     uintptr_t addr = (uintptr_t) target;
 
-    // 1) 近距 trampoline：64 位绝对跳转到补丁(补丁可在任意远处)。
-    void *tramp = alloc_near_page(addr);
-    if (!tramp) { LOGE("no free page within +/-128MB of target"); return -3; }
-    uint32_t *t = (uint32_t *) tramp;
+    // 查表：同一目标函数是否已 hook 过 —— 复用已有 trampoline 页，只更新其中的补丁地址，
+    // 不再 mmap，从而彻底消除反复热修导致的 trampoline 页泄漏。
+    // g_hooks / g_hook_count 用互斥锁保护，防止多线程并发 hook 导致 data race。
+    pthread_mutex_lock(&g_lock);
+    uint32_t *existing = find_tramp(addr);
+    uint32_t *t;
+
+    if (existing) {
+        // 已 hook：临时解保护，更新 8 字节补丁地址，重新设回 RX。
+        if (mprotect(existing, page, PROT_READ | PROT_WRITE) != 0) {
+            pthread_mutex_unlock(&g_lock);
+            LOGE("mprotect existing tramp RW failed"); return -6;
+        }
+        t = existing;
+    } else {
+        // 首次 hook：分配近距 trampoline 页。
+        void *tramp = alloc_near_page(addr);
+        if (!tramp) {
+            pthread_mutex_unlock(&g_lock);
+            LOGE("no free page within +/-128MB of target"); return -3;
+        }
+        t = (uint32_t *) tramp;
+        if (g_hook_count < MAX_HOOKS)
+            g_hooks[g_hook_count++] = (HookEntry){ addr, t };
+        else
+            LOGE("hook table full, trampoline tracking disabled for %p", target);
+    }
+    pthread_mutex_unlock(&g_lock);
+
+    // 1) 写 trampoline：LDR X17,#8 ; BR X17 ; <8 字节补丁绝对地址>
     t[0] = 0x58000051;                  // LDR X17, #8
     t[1] = 0xD61F0220;                  // BR  X17
     uint64_t pa = (uint64_t) patch;
-    memcpy(&t[2], &pa, sizeof(pa));     // 8 字节补丁绝对地址
-    __builtin___clear_cache((char *) tramp, (char *) tramp + 16);
-    if (mprotect(tramp, page, PROT_READ | PROT_EXEC) != 0) {
-        LOGE("mprotect tramp RX failed"); munmap(tramp, page); return -4;
+    memcpy(&t[2], &pa, sizeof(pa));
+    __builtin___clear_cache((char *) t, (char *) t + 16);
+    if (mprotect(t, page, PROT_READ | PROT_EXEC) != 0) {
+        LOGE("mprotect tramp RX failed");
+        if (!existing) munmap(t, page);
+        return -4;
     }
 
-    // 2) 目标入口只写 4 字节 B -> trampoline（只覆盖 1 条指令，短函数也安全）。
-    intptr_t delta = (intptr_t) ((uintptr_t) tramp - addr);
-    if (delta < -(intptr_t) B_RANGE || delta >= (intptr_t) B_RANGE) {
-        LOGE("trampoline out of B range: delta=%td", delta); return -5;
-    }
-    uint32_t br = 0x14000000u | (((uint32_t) (delta >> 2)) & 0x03FFFFFFu);   // B imm26
+    // 2) 首次 hook 才需写目标入口的 B 指令（复用时 B 已存在，trampoline 地址未变）。
+    if (!existing) {
+        intptr_t delta = (intptr_t) ((uintptr_t) t - addr);
+        if (delta < -(intptr_t) B_RANGE || delta >= (intptr_t) B_RANGE) {
+            LOGE("trampoline out of B range: delta=%td", delta); return -5;
+        }
+        uint32_t br = 0x14000000u | (((uint32_t) (delta >> 2)) & 0x03FFFFFFu);   // B imm26
 
-    uintptr_t pstart = addr & ~(page - 1);
-    uintptr_t pend = (addr + 4 + page - 1) & ~(page - 1);
-    if (mprotect((void *) pstart, pend - pstart, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-        LOGE("mprotect target RWX failed"); return -2;
+        uintptr_t pstart = addr & ~(page - 1);
+        uintptr_t pend = (addr + 4 + page - 1) & ~(page - 1);
+        if (mprotect((void *) pstart, pend - pstart, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+            LOGE("mprotect target RWX failed"); return -2;
+        }
+        *(uint32_t *) target = br;
+        __builtin___clear_cache((char *) target, (char *) target + 4);
+        mprotect((void *) pstart, pend - pstart, PROT_READ | PROT_EXEC);
     }
-    *(uint32_t *) target = br;
-    __builtin___clear_cache((char *) target, (char *) target + 4);
-    mprotect((void *) pstart, pend - pstart, PROT_READ | PROT_EXEC);
 
-    LOGI("hooked: target=%p -> tramp=%p -> patch=%p (B delta=%td)", target, tramp, patch, delta);
+    LOGI("%s hooked: target=%p -> tramp=%p -> patch=%p",
+         existing ? "re" : "", target, (void *) t, patch);
     return 0;
 }
 #endif
