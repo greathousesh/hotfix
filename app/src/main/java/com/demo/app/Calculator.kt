@@ -12,4 +12,8 @@ package com.demo.app
  */
 class Calculator {
     fun add(a: Int, b: Int): Int = a - b   // BUG：本应 a + b，补丁会修复
+
+    companion object {
+        fun multiply(a: Int, b: Int): Int = a + b   // BUG：本应 a * b，补丁会修复
+    }
 }

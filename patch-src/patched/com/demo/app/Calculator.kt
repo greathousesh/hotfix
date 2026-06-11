@@ -19,4 +19,8 @@ class Calculator {
         }
         return fixed.value()
     }
+
+    companion object {
+        fun multiply(a: Int, b: Int): Int = a * b   // 修复：改回乘法
+    }
 }

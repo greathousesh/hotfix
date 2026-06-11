@@ -59,11 +59,12 @@ object PatchOverrideGenerator {
 
         // mapping.txt 一次性解析成 orig(点分) -> obf(点分)；无 mapping(debug) 则为空表、查不到回退原名。
         val classMapping = parseClassMapping(config.mappingFile)
+        // 非 synthetic 的非接口类均视为可热修类：覆盖顶层类、$Companion、命名内部类。
+        // 匿名类/lambda/WhenMappings 等编译器合成类带 ACC_SYNTHETIC，走 genHelper 路径。
         val topClasses = classNodes.filter { cn ->
-            cn.name.substringAfterLast('/').indexOf('$') < 0 &&
-                cn.access and (Opcodes.ACC_INTERFACE or Opcodes.ACC_ANNOTATION) == 0
+            cn.access and (Opcodes.ACC_SYNTHETIC or Opcodes.ACC_INTERFACE or Opcodes.ACC_ANNOTATION) == 0
         }
-        require(topClasses.isNotEmpty()) { "no patchable top-level .class found under $inDir" }
+        require(topClasses.isNotEmpty()) { "no patchable class found under $inDir" }
 
         val remapNames = buildClassRemap(classNodes, topClasses, classMapping, config)
         val remapper = object : Remapper() {
