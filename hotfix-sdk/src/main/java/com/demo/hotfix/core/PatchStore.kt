@@ -25,8 +25,10 @@ internal class PatchStore(ctx: Context) {
     private val resourceStore = TypedStore("resource")
     private val nativeStore = TypedStore("native")
 
-    fun savePendingJava(input: InputStream): File =
+    fun savePendingJava(input: InputStream): File = withStoreLock {
+        javaStore.discardPending()
         write(input, javaStore.pendingFile("patch.dex"))
+    }
 
     fun commitJava() = withStoreLock { javaStore.promotePending() }
 
@@ -43,8 +45,10 @@ internal class PatchStore(ctx: Context) {
         legacyDex.delete()
     }
 
-    fun savePendingResource(input: InputStream): File =
+    fun savePendingResource(input: InputStream): File = withStoreLock {
+        resourceStore.discardPending()
         write(input, resourceStore.pendingFile("patch_res.apk"))
+    }
 
     fun commitResource() = withStoreLock { resourceStore.promotePending() }
 
@@ -61,14 +65,14 @@ internal class PatchStore(ctx: Context) {
         legacyRes.delete()
     }
 
-    fun savePendingNative(input: InputStream, hooks: List<NativeHook>): File {
+    fun savePendingNative(input: InputStream, hooks: List<NativeHook>): File = withStoreLock {
         nativeStore.discardPending()
         val so = nativeStore.pendingFile("libpatch.so")
         val nativeSpec = nativeStore.pendingFile("native_hooks.txt")
         write(input, so)
         val specContent = hooks.joinToString("\n") { "${it.targetLib}|${it.targetSym}|${it.patchSym}" }
         writeText(specContent, nativeSpec)
-        return so
+        so
     }
 
     fun commitNative() = withStoreLock { nativeStore.promotePending() }

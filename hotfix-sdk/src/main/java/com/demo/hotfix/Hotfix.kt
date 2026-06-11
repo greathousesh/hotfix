@@ -8,7 +8,9 @@ import com.demo.hotfix.core.JavaPatcher
 import com.demo.hotfix.core.PatchStore
 import com.demo.hotfix.nativehook.NativeHotfix
 import com.demo.hotfix.res.ResourcePatcher
+import java.io.File
 import java.io.InputStream
+import java.security.MessageDigest
 import java.util.concurrent.CountDownLatch
 
 /**
@@ -62,10 +64,19 @@ object Hotfix {
     }
 
     /** 安装代码补丁：保存 dex 到 SDK 路径 + 立即热修（InstantPatch 式 $ipChange 重定向）。 */
-    fun installJavaPatch(input: InputStream): Boolean {
+    fun installJavaPatch(input: InputStream): Boolean =
+        installJavaPatch(input, PatchVerifySpec())
+
+    /** 安装代码补丁；可选校验目标 base 版本和补丁 SHA-256。 */
+    fun installJavaPatch(input: InputStream, verify: PatchVerifySpec): Boolean {
         ensureInit()
         warnIfMainThread("installJavaPatch")
+        if (!verifyTargetBaseVersion("java", verify)) return false
         val dex = store.savePendingJava(input)
+        if (!verifyPendingFile("java", dex, verify)) {
+            store.discardPendingJava()
+            return false
+        }
         return try {
             val ok = onMain { JavaPatcher.apply(app, dex.absolutePath, baseVersion, loaderClass) }
             if (ok) store.commitJava() else store.discardPendingJava()
@@ -78,10 +89,19 @@ object Hotfix {
     }
 
     /** 安装资源补丁：保存 apk 到 SDK 路径 + 立即换资源（MonkeyPatcher 式 AssetManager 替换）。 */
-    fun installResourcePatch(input: InputStream): Boolean {
+    fun installResourcePatch(input: InputStream): Boolean =
+        installResourcePatch(input, PatchVerifySpec())
+
+    /** 安装资源补丁；可选校验目标 base 版本和补丁 SHA-256。 */
+    fun installResourcePatch(input: InputStream, verify: PatchVerifySpec): Boolean {
         ensureInit()
         warnIfMainThread("installResourcePatch")
+        if (!verifyTargetBaseVersion("resource", verify)) return false
         val apk = store.savePendingResource(input)
+        if (!verifyPendingFile("resource", apk, verify)) {
+            store.discardPendingResource()
+            return false
+        }
         return try {
             val ok = onMain { ResourcePatcher.apply(app, apk.absolutePath) }
             if (ok) store.commitResource() else store.discardPendingResource()
@@ -94,10 +114,19 @@ object Hotfix {
     }
 
     /** 安装 Native 补丁：保存 so + 记录 hook 规格 + 立即内联 hook。hook 规格也被持久化供冷启动续用。 */
-    fun installNativePatch(input: InputStream, hooks: List<NativeHook>): Boolean {
+    fun installNativePatch(input: InputStream, hooks: List<NativeHook>): Boolean =
+        installNativePatch(input, hooks, PatchVerifySpec())
+
+    /** 安装 Native 补丁；可选校验目标 base 版本和补丁 so 的 SHA-256。 */
+    fun installNativePatch(input: InputStream, hooks: List<NativeHook>, verify: PatchVerifySpec): Boolean {
         ensureInit()
         warnIfMainThread("installNativePatch")
+        if (!verifyTargetBaseVersion("native", verify)) return false
         val so = store.savePendingNative(input, hooks)
+        if (!verifyPendingFile("native", so, verify)) {
+            store.discardPendingNative()
+            return false
+        }
         return try {
             val ok = onMain { applyNative(so.absolutePath, hooks) }
             if (ok) store.commitNative() else store.discardPendingNative()
@@ -116,6 +145,37 @@ object Hotfix {
         if (Looper.myLooper() == Looper.getMainLooper()) {
             Log.w(TAG, "$name() called on main thread — move to a background thread to avoid blocking UI")
         }
+    }
+
+    private fun verifyTargetBaseVersion(kind: String, verify: PatchVerifySpec): Boolean {
+        val target = verify.targetBaseVersion ?: return true
+        if (target == baseVersion) return true
+        Log.e(TAG, "$kind patch target base mismatch: host=$baseVersion patch=$target")
+        return false
+    }
+
+    private fun verifyPendingFile(kind: String, file: File, verify: PatchVerifySpec): Boolean {
+        val expected = verify.sha256?.normalizeSha256() ?: return true
+        val actual = file.sha256()
+        if (actual == expected) return true
+        Log.e(TAG, "$kind patch sha256 mismatch: expected=$expected actual=$actual")
+        return false
+    }
+
+    private fun String.normalizeSha256(): String =
+        trim().replace(":", "").lowercase()
+
+    private fun File.sha256(): String {
+        val md = MessageDigest.getInstance("SHA-256")
+        inputStream().use { input ->
+            val buf = ByteArray(DEFAULT_BUFFER_SIZE)
+            while (true) {
+                val read = input.read(buf)
+                if (read < 0) break
+                md.update(buf, 0, read)
+            }
+        }
+        return md.digest().joinToString("") { "%02x".format(it.toInt() and 0xff) }
     }
 
     private fun applyNative(soPath: String, hooks: List<NativeHook>): Boolean {
