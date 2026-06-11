@@ -13,5 +13,10 @@ package com.demo.app
  * 那属于冷补丁/重启场景）。想验证补丁是否真的生效：把下面改回 a - b，重打补丁后结果应变回 -1。
  */
 class Calculator {
-    fun add(a: Int, b: Int): Int = a + b   // ★ 修复（原 bug 为 a - b）
+    fun add(a: Int, b: Int): Int {
+        val fixed = object {
+            fun value(): Int = a + b
+        }
+        return fixed.value()
+    }
 }

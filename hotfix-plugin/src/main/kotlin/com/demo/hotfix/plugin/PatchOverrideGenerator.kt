@@ -5,9 +5,11 @@ import org.objectweb.asm.ClassWriter
 import org.objectweb.asm.Opcodes
 import org.objectweb.asm.Type
 import org.objectweb.asm.commons.GeneratorAdapter
+import org.objectweb.asm.commons.ClassRemapper
+import org.objectweb.asm.commons.MethodRemapper
 import org.objectweb.asm.commons.Method as AsmMethod
+import org.objectweb.asm.commons.Remapper
 import org.objectweb.asm.tree.ClassNode
-import org.objectweb.asm.tree.MethodNode
 import java.io.File
 
 /**
@@ -47,26 +49,42 @@ object PatchOverrideGenerator {
     }
 
     fun generate(inDir: File, outDir: File, config: Config) {
-        val classes = inDir.walkTopDown()
+        val classNodes = inDir.walkTopDown()
             .filter { it.isFile && it.extension == "class" }
-            .filter { !it.nameWithoutExtension.contains('$') }   // 跳过嵌套/合成类
+            .map { cf ->
+                ClassNode().also { ClassReader(cf.readBytes()).accept(it, ClassReader.SKIP_DEBUG or ClassReader.SKIP_FRAMES) }
+            }
             .toList()
-        require(classes.isNotEmpty()) { "no .class found under $inDir" }
+        require(classNodes.isNotEmpty()) { "no .class found under $inDir" }
 
         // mapping.txt 一次性解析成 orig(点分) -> obf(点分)；无 mapping(debug) 则为空表、查不到回退原名。
         val classMapping = parseClassMapping(config.mappingFile)
+        val topClasses = classNodes.filter { cn ->
+            cn.name.substringAfterLast('/').indexOf('$') < 0 &&
+                cn.access and (Opcodes.ACC_INTERFACE or Opcodes.ACC_ANNOTATION) == 0
+        }
+        require(topClasses.isNotEmpty()) { "no patchable top-level .class found under $inDir" }
+
+        val remapNames = buildClassRemap(classNodes, topClasses, classMapping, config)
+        val remapper = object : Remapper() {
+            override fun map(internalName: String): String =
+                remapNames[internalName] ?: internalName
+        }
 
         // 运行时类名 -> 分发类内部名（供 PatchesLoaderImpl 装 Map）
         val loaderEntries = LinkedHashMap<String, String>()
-        for (cf in classes) {
-            val cn = ClassNode().also { ClassReader(cf.readBytes()).accept(it, ClassReader.SKIP_FRAMES) }
-            if (cn.access and (Opcodes.ACC_INTERFACE or Opcodes.ACC_ANNOTATION) != 0) continue
+        for (cn in topClasses) {
             val origDot    = cn.name.replace('/', '.')
             val runtimeName = classMapping[origDot] ?: origDot
-            val (dispName, bytes) = genDispatcher(cn, runtimeName, config)
+            val (dispName, bytes) = genDispatcher(cn, runtimeName, config, remapper)
             write(outDir, dispName, bytes)
             loaderEntries[runtimeName] = dispName
             println("[PatchOverrideGenerator] ${cn.name} -> $dispName  (运行时 key=$runtimeName, ${bytes.size}B)")
+        }
+        for (cn in classNodes - topClasses.toSet()) {
+            val (helperName, helperBytes) = genHelper(cn, remapper)
+            write(outDir, helperName, helperBytes)
+            println("[PatchOverrideGenerator] helper ${cn.name} -> $helperName  (${helperBytes.size}B)")
         }
 
         val loaderBytes = genLoader(loaderEntries, config)
@@ -107,6 +125,26 @@ object PatchOverrideGenerator {
         target.writeBytes(bytes)
     }
 
+    private fun buildClassRemap(
+        classNodes: List<ClassNode>,
+        topClasses: List<ClassNode>,
+        classMapping: Map<String, String>,
+        config: Config,
+    ): Map<String, String> {
+        val topNames = topClasses.mapTo(HashSet()) { it.name }
+        val out = HashMap<String, String>()
+        for (cn in topClasses) {
+            val runtimeName = classMapping[cn.name.replace('/', '.')] ?: cn.name.replace('/', '.')
+            out[cn.name] = runtimeName.replace('.', '/')
+        }
+        for (cn in classNodes) {
+            if (cn.name !in topNames) {
+                out[cn.name] = "${config.patchPkg}/${cn.name.substringAfterLast('/')}"
+            }
+        }
+        return out
+    }
+
     // 生成器 classpath 上没有 Calculator/IpChange 等类，帧计算需要的 common-super 找不到就回退 Object。
     // ⚠️ 局限：若某方法体内**两个不相关引用类型在分支汇合处合并**，被强行归并成 Object 会算出错误的
     //    StackMapTable -> 运行时 VerifyError。简单补丁(如 add，无此类合并)不触发；要彻底正确需把宿主/补丁
@@ -138,7 +176,12 @@ object PatchOverrideGenerator {
      *   跳板首参(self)类型与 ipcDispatch 里的 checkcast 必须用这个名字 —— 宿主传进来的 args[0] 是混淆类的实例，
      *   若仍用原始名 com/demo/app/Calculator，release 下该类已不存在 -> NoClassDefFoundError。
      */
-    private fun genDispatcher(cn: ClassNode, runtimeDotName: String, config: Config): Pair<String, ByteArray> {
+    private fun genDispatcher(
+        cn: ClassNode,
+        runtimeDotName: String,
+        config: Config,
+        remapper: Remapper,
+    ): Pair<String, ByteArray> {
         val origInternal = cn.name
         val ownerInternal = runtimeDotName.replace('.', '/')
         val simple   = origInternal.substringAfterLast('/')
@@ -149,12 +192,19 @@ object PatchOverrideGenerator {
         cw.visit(Opcodes.V1_8, Opcodes.ACC_PUBLIC or Opcodes.ACC_SUPER, dispName, null, "java/lang/Object", arrayOf(config.ipChange))
         emitDefaultCtor(cw)
 
-        val entries = emitTrampolines(cn, ownerInternal, origInternal, cw)
+        val entries = emitTrampolines(cn, ownerInternal, origInternal, cw, remapper)
         emitDispatchIndex(entries, dispType, cw)
         emitIpcDispatch(entries, dispType, cw)
 
         cw.visitEnd()
         return dispName to cw.toByteArray()
+    }
+
+    /** 复制 Kotlin 生成的 lambda/内部/默认参数 helper 类，并重写其 owner，避免 parent-first 加载到宿主旧类。 */
+    private fun genHelper(cn: ClassNode, remapper: Remapper): Pair<String, ByteArray> {
+        val cw = newWriter()
+        cn.accept(ClassRemapper(cw, remapper))
+        return remapper.map(cn.name) to cw.toByteArray()
     }
 
     /** 把被修类的每个可插桩方法转成 static 跳板 _p0/_p1/...，实例方法前插 self 首参保持 slot 对齐。 */
@@ -163,6 +213,7 @@ object PatchOverrideGenerator {
         ownerInternal: String,
         origInternal: String,
         cw: ClassWriter,
+        remapper: Remapper,
     ): List<Entry> {
         val ownerType = Type.getObjectType(ownerInternal)
         val skip = Opcodes.ACC_ABSTRACT or Opcodes.ACC_NATIVE or Opcodes.ACC_SYNTHETIC or Opcodes.ACC_BRIDGE
@@ -179,11 +230,14 @@ object PatchOverrideGenerator {
             val trampDesc = Type.getMethodDescriptor(ret, *trampArgs)
             val trampName = "_p$trampIdx"
 
-            val mn = MethodNode(Opcodes.ACC_PUBLIC or Opcodes.ACC_STATIC, trampName, trampDesc, null, m.exceptions?.toTypedArray())
-            mn.instructions    = m.instructions   // 只搬方法体，丢弃调试信息(参数表/局部变量表)避免 self 首参错位
-            mn.tryCatchBlocks  = m.tryCatchBlocks
-            // 不拷 maxStack/maxLocals：COMPUTE_FRAMES 会连 maxs 一起重算，传什么都被忽略。
-            mn.accept(cw)
+            val mv = cw.visitMethod(
+                Opcodes.ACC_PUBLIC or Opcodes.ACC_STATIC,
+                trampName,
+                trampDesc,
+                null,
+                m.exceptions?.toTypedArray()
+            )
+            m.accept(MethodRemapper(mv, remapper))
 
             // methodId 用**原始**类名 —— 与 HotfixMethodVisitor 烤进宿主方法头的字符串常量对齐(R8 不改字符串)。
             entries += Entry(methodId(origInternal, m.name, m.desc), trampName, trampDesc, trampArgs, ret)
