@@ -17,7 +17,7 @@ class Calculator {
         val fixed = object {
             fun value(): Int = a + b
         }
-        return fixed.value()
+        return fixed.value() + multiply(a, b)
     }
 
     companion object {

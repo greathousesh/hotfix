@@ -2,6 +2,7 @@ package com.demo.hotfix.plugin
 
 import org.objectweb.asm.ClassReader
 import org.objectweb.asm.ClassWriter
+import org.objectweb.asm.MethodVisitor
 import org.objectweb.asm.Opcodes
 import org.objectweb.asm.Type
 import org.objectweb.asm.commons.GeneratorAdapter
@@ -57,8 +58,8 @@ object PatchOverrideGenerator {
             .toList()
         require(classNodes.isNotEmpty()) { "no .class found under $inDir" }
 
-        // mapping.txt 一次性解析成 orig(点分) -> obf(点分)；无 mapping(debug) 则为空表、查不到回退原名。
-        val classMapping = parseClassMapping(config.mappingFile)
+        // mapping.txt 一次性解析类名 + 成员名重映射；无 mapping(debug) 则均为空表。
+        val (classMapping, memberMapping) = parseMappings(config.mappingFile)
         // 可热修类判定：非 synthetic、非接口，且末段 $-segment 含非数字字符。
         //   ACC_SYNTHETIC  → 过滤 Java 匿名类 / Kotlin lambda / WhenMappings 等编译器合成类
         //   末段全数字      → 过滤 Kotlin object 表达式（如 Calculator$add$fixed$1）——
@@ -72,16 +73,25 @@ object PatchOverrideGenerator {
 
         val remapNames = buildClassRemap(classNodes, topClasses, classMapping, config)
         val remapper = object : Remapper() {
-            override fun map(internalName: String): String =
+            override fun map(internalName: String) =
                 remapNames[internalName] ?: internalName
+            // R8 会重命名字段（如 Companion -> a）和方法，必须一并重写，否则 GETSTATIC/INVOKEVIRTUAL 引用已不存在的名字。
+            override fun mapFieldName(owner: String, name: String, descriptor: String) =
+                memberMapping["$owner\n$name\n$descriptor"] ?: name
+            override fun mapMethodName(owner: String, name: String, descriptor: String) =
+                memberMapping["$owner\n$name\n$descriptor"] ?: name
         }
+
+        // 预先建立跨补丁调用重定向表：补丁方法体中若调用了「同批次也被修」的方法（R8 可能已将其内联
+        // 导致宿主里不再存在该虚方法），跳板必须直接调用对应分发类的 static 跳板，而不能走宿主虚方法。
+        val crossCallMap = buildCrossCallMap(topClasses, classMapping, config)
 
         // 运行时类名 -> 分发类内部名（供 PatchesLoaderImpl 装 Map）
         val loaderEntries = LinkedHashMap<String, String>()
         for (cn in topClasses) {
             val origDot    = cn.name.replace('/', '.')
             val runtimeName = classMapping[origDot] ?: origDot
-            val (dispName, bytes) = genDispatcher(cn, runtimeName, config, remapper)
+            val (dispName, bytes) = genDispatcher(cn, runtimeName, config, remapper, crossCallMap)
             write(outDir, dispName, bytes)
             loaderEntries[runtimeName] = dispName
             println("[PatchOverrideGenerator] ${cn.name} -> $dispName  (运行时 key=$runtimeName, ${bytes.size}B)")
@@ -107,27 +117,157 @@ object PatchOverrideGenerator {
         sdkPackage:  String = HotfixPatchExtension.DEFAULT_SDK_PACKAGE,
     ) = generate(inDir, outDir, Config(baseVersion, mappingFile, loaderClass, sdkPackage))
 
+    private data class Mappings(
+        val classes: Map<String, String>,   // orig dot → runtime dot
+        val members: Map<String, String>,   // "ownerInternal\nname\ndescriptor" → renamed name
+    )
+
     /**
-     * 解析 proguard/R8 mapping.txt 的**类重命名行** `com.demo.app.Calculator -> a.a:`。
-     * 只取顶格(列0)、以 `:` 结尾的类行；缩进的成员行(`    int f -> a`)与 `#` 注释行跳过。
+     * 解析 R8/ProGuard mapping.txt：
+     *  - 顶格类行 `com.Foo -> a.b:` → [Mappings.classes]
+     *  - 缩进成员行（字段和方法）→ [Mappings.members]，key = "ownerInternal\nname\ndesc"
+     *
+     * 字段示例：`    com.Foo$Companion Companion -> a`
+     * 方法示例：`    3:5:int add(int,int):6:8 -> b`（行号前缀/后缀会被剥除）
+     * 内联方法行（name 含 `.`，如 `com.Other.foo`）跳过——它们是宿主行号信息，非当前类成员。
      */
-    private fun parseClassMapping(mappingFile: File?): Map<String, String> {
-        if (mappingFile == null || !mappingFile.isFile) return emptyMap()
-        val map = HashMap<String, String>()
-        for (line in mappingFile.readLines()) {
-            if (line.isEmpty() || line[0].isWhitespace() || line[0] == '#') continue
-            if (!line.endsWith(":")) continue
-            val arrow = line.indexOf(" -> ")
-            if (arrow < 0) continue
-            map[line.substring(0, arrow)] = line.substring(arrow + 4, line.length - 1)
+    private fun parseMappings(mappingFile: File?): Mappings {
+        if (mappingFile == null || !mappingFile.isFile) return Mappings(emptyMap(), emptyMap())
+        val classes = HashMap<String, String>()
+        val members = HashMap<String, String>()
+        var curOwner = ""   // 当前正在解析的类（internal 格式）
+        for (rawLine in mappingFile.readLines()) {
+            val line = rawLine.trimEnd()
+            if (line.isEmpty() || line.startsWith("#")) continue
+            if (!line[0].isWhitespace()) {
+                // 类行：com.demo.app.Foo -> a.b:
+                if (!line.endsWith(":")) continue
+                val arrow = line.indexOf(" -> ")
+                if (arrow < 0) continue
+                val orig    = line.substring(0, arrow)
+                val renamed = line.substring(arrow + 4, line.length - 1)
+                classes[orig] = renamed
+                curOwner = orig.replace('.', '/')
+            } else {
+                // 成员行
+                if (curOwner.isEmpty()) continue
+                val trimmed = line.trimStart()
+                if (trimmed.startsWith("#")) continue
+                val arrowIdx = trimmed.lastIndexOf(" -> ")
+                if (arrowIdx < 0) continue
+                val renamedMember = trimmed.substring(arrowIdx + 4)
+
+                // 剥除行号前缀 "N:N:"
+                var sig = trimmed.substring(0, arrowIdx)
+                val firstColon = sig.indexOf(':')
+                if (firstColon >= 0 && sig.substring(0, firstColon).all { it.isDigit() }) {
+                    val secondColon = sig.indexOf(':', firstColon + 1)
+                    if (secondColon >= 0) sig = sig.substring(secondColon + 1)
+                }
+                sig = sig.trim()
+                // 剥除行号后缀 ":N:N"
+                sig = sig.replace(Regex(":\\d+:\\d+$"), "").trimEnd()
+
+                val parenIdx = sig.indexOf('(')
+                if (parenIdx < 0) {
+                    // 字段行：<type> <name>
+                    val sp = sig.lastIndexOf(' ')
+                    if (sp < 0) continue
+                    val name = sig.substring(sp + 1).trim()
+                    if (name.contains('.')) continue        // 跳过内联引用
+                    val desc = typeToDescriptor(sig.substring(0, sp).trim())
+                    members["$curOwner\n$name\n$desc"] = renamedMember
+                } else {
+                    // 方法行：<returnType> <name>(<params>)
+                    val closeParen = sig.lastIndexOf(')')
+                    if (closeParen < 0) continue
+                    val beforeParen = sig.substring(0, parenIdx)
+                    val sp = beforeParen.lastIndexOf(' ')
+                    if (sp < 0) continue
+                    val name = beforeParen.substring(sp + 1).trim()
+                    if (name.contains('.')) continue        // 跳过内联方法
+                    val retDesc = typeToDescriptor(beforeParen.substring(0, sp).trim())
+                    val paramStr = sig.substring(parenIdx + 1, closeParen)
+                    val paramDescs = if (paramStr.isBlank()) ""
+                        else paramStr.split(',').joinToString("") { typeToDescriptor(it.trim()) }
+                    members["$curOwner\n$name\n($paramDescs)$retDesc"] = renamedMember
+                }
+            }
         }
-        return map
+        return Mappings(classes, members)
+    }
+
+    /** ProGuard/R8 dot-notation type → ASM descriptor（递归处理数组）。 */
+    private fun typeToDescriptor(t: String): String = when {
+        t.endsWith("[]") -> "[" + typeToDescriptor(t.dropLast(2))
+        else -> when (t) {
+            "void"    -> "V";  "boolean" -> "Z";  "byte"  -> "B";  "char"   -> "C"
+            "short"   -> "S";  "int"     -> "I";  "long"  -> "J"
+            "float"   -> "F";  "double"  -> "D"
+            else      -> "L${t.replace('.', '/')};"
+        }
     }
 
     private fun write(outDir: File, internalName: String, bytes: ByteArray) {
         val target = File(outDir, "$internalName.class")
         target.parentFile.mkdirs()
         target.writeBytes(bytes)
+    }
+
+    /**
+     * 预扫描所有被修类，建立「原始方法签名 → 补丁跳板」重定向表。
+     * key   = "origOwnerInternal\nmethodName\norigDesc"
+     * value = Triple(dispatcherInternal, trampName, trampDesc)
+     *
+     * 用途：当某补丁方法体中调用了同批次另一个被修类的方法（如 add 调 multiply），
+     * 若 R8 已将目标方法内联，宿主中不再存在该虚方法，跳板直接调用对应补丁分发类的 static 跳板即可。
+     */
+    private fun buildCrossCallMap(
+        topClasses: List<ClassNode>,
+        classMapping: Map<String, String>,
+        config: Config,
+    ): Map<String, Triple<String, String, String>> {
+        val skip = Opcodes.ACC_ABSTRACT or Opcodes.ACC_NATIVE or Opcodes.ACC_SYNTHETIC or Opcodes.ACC_BRIDGE
+        val map  = HashMap<String, Triple<String, String, String>>()
+        for (cn in topClasses) {
+            val origDot     = cn.name.replace('/', '.')
+            val rtInternal  = (classMapping[origDot] ?: origDot).replace('.', '/')
+            val ownerType   = Type.getObjectType(rtInternal)
+            val dispName    = "${config.patchPkg}/${cn.name.substringAfterLast('/')}Patch"
+            for ((idx, m) in cn.methods.withIndex()) {
+                if (m.name == "<init>" || m.name == "<clinit>") continue
+                if (m.access and skip != 0) continue
+                val isStatic   = m.access and Opcodes.ACC_STATIC != 0
+                val trampArgs  = if (isStatic) Type.getArgumentTypes(m.desc)
+                                 else arrayOf(ownerType, *Type.getArgumentTypes(m.desc))
+                val trampDesc  = Type.getMethodDescriptor(Type.getReturnType(m.desc), *trampArgs)
+                map["${cn.name}\n${m.name}\n${m.desc}"] = Triple(dispName, "_p$idx", trampDesc)
+            }
+        }
+        return map
+    }
+
+    /**
+     * MethodRemapper 子类：对「同批次补丁类中的方法调用」直接重定向到对应分发类的 static 跳板（INVOKESTATIC），
+     * 完全绕过宿主中可能已被 R8 内联/移除的虚方法；其余调用走正常的 Remapper 逻辑。
+     *
+     * 栈一致性：INVOKEVIRTUAL owner.method(args) 消耗 [this, args...]，
+     * 而重定向后的 INVOKESTATIC Patch._pN(owner_type, args) 同样消耗 [this, args...]（跳板首参 = self）。
+     */
+    private class CrossPatchMethodVisitor(
+        delegate: MethodVisitor,
+        remapper: Remapper,
+        private val crossCallMap: Map<String, Triple<String, String, String>>,
+    ) : MethodRemapper(delegate, remapper) {
+        override fun visitMethodInsn(opcode: Int, owner: String, name: String, descriptor: String, isInterface: Boolean) {
+            val redirect = crossCallMap["$owner\n$name\n$descriptor"]
+            if (redirect != null) {
+                val (dispInternal, trampName, trampDesc) = redirect
+                mv.visitMethodInsn(Opcodes.INVOKESTATIC, dispInternal, trampName, trampDesc, false)
+            } else {
+                super.visitMethodInsn(opcode, owner, name, descriptor, isInterface)
+            }
+        }
     }
 
     private fun buildClassRemap(
@@ -186,6 +326,7 @@ object PatchOverrideGenerator {
         runtimeDotName: String,
         config: Config,
         remapper: Remapper,
+        crossCallMap: Map<String, Triple<String, String, String>>,
     ): Pair<String, ByteArray> {
         val origInternal = cn.name
         val ownerInternal = runtimeDotName.replace('.', '/')
@@ -197,7 +338,7 @@ object PatchOverrideGenerator {
         cw.visit(Opcodes.V1_8, Opcodes.ACC_PUBLIC or Opcodes.ACC_SUPER, dispName, null, "java/lang/Object", arrayOf(config.ipChange))
         emitDefaultCtor(cw)
 
-        val entries = emitTrampolines(cn, ownerInternal, origInternal, cw, remapper)
+        val entries = emitTrampolines(cn, ownerInternal, origInternal, cw, remapper, crossCallMap)
         emitDispatchIndex(entries, dispType, cw)
         emitIpcDispatch(entries, dispType, cw)
 
@@ -219,6 +360,7 @@ object PatchOverrideGenerator {
         origInternal: String,
         cw: ClassWriter,
         remapper: Remapper,
+        crossCallMap: Map<String, Triple<String, String, String>>,
     ): List<Entry> {
         val ownerType = Type.getObjectType(ownerInternal)
         val skip = Opcodes.ACC_ABSTRACT or Opcodes.ACC_NATIVE or Opcodes.ACC_SYNTHETIC or Opcodes.ACC_BRIDGE
@@ -242,7 +384,7 @@ object PatchOverrideGenerator {
                 null,
                 m.exceptions?.toTypedArray()
             )
-            m.accept(MethodRemapper(mv, remapper))
+            m.accept(CrossPatchMethodVisitor(mv, remapper, crossCallMap))
 
             // methodId 用**原始**类名 —— 与 HotfixMethodVisitor 烤进宿主方法头的字符串常量对齐(R8 不改字符串)。
             entries += Entry(methodId(origInternal, m.name, m.desc), trampName, trampDesc, trampArgs, ret)
