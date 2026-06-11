@@ -73,6 +73,7 @@ class HotfixPatchPlugin : Plugin<Project> {
                 it.classesDir.set(kotlinClasses)
                 it.baseVersion.set(baseVersionProvider)
                 it.loaderClass.set(project.provider { ext.loaderClass })
+                it.sdkPackage.set(project.provider { ext.sdkPackage })
                 // release 的 mapping.txt 由 :app 的 R8 产出 -> 显式依赖，否则 Gradle 报隐式依赖错
                 if (variant == "release") {
                     it.mappingFile.set(mapping)
@@ -181,13 +182,14 @@ abstract class GeneratePatchTask : DefaultTask() {
     @get:Optional @get:InputFile abstract val mappingFile: RegularFileProperty
     @get:Input abstract val baseVersion: Property<String>
     @get:Input abstract val loaderClass: Property<String>
+    @get:Input abstract val sdkPackage: Property<String>
     @get:OutputDirectory abstract val outputDir: DirectoryProperty
 
     @TaskAction fun run() {
         val out = outputDir.get().asFile
         out.deleteRecursively(); out.mkdirs()
         val mf = mappingFile.orNull?.asFile?.takeIf { it.exists() }
-        PatchOverrideGenerator.generate(classesDir.get().asFile, out, baseVersion.get(), mf, loaderClass.get())
+        PatchOverrideGenerator.generate(classesDir.get().asFile, out, baseVersion.get(), mf, loaderClass.get(), sdkPackage.get())
     }
 }
 

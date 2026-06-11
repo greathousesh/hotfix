@@ -11,6 +11,9 @@ package com.demo.hotfix.plugin
  *
  *     // loaderClass 默认 'com.demo.patch.PatchesLoaderImpl'，与 JavaPatcher 约定对齐
  *     // loaderClass = 'com.mycompany.patch.PatchesLoaderImpl'
+ *
+ *     // sdkPackage 默认 'com.demo.hotfix'，换包名发布 SDK 时修改
+ *     // sdkPackage = 'com.mycompany.hotfix'
  * }
  * ```
  */
@@ -27,7 +30,14 @@ open class HotfixPatchExtension {
      */
     var loaderClass: String = DEFAULT_LOADER_CLASS
 
+    /**
+     * hotfix-sdk 的根包名。[PatchOverrideGenerator] 用它推导 IpChange / PatchesLoader 的内部类名。
+     * 换包名发布 SDK 时修改此值，无需改插件源码。
+     */
+    var sdkPackage: String = DEFAULT_SDK_PACKAGE
+
     companion object {
         const val DEFAULT_LOADER_CLASS = "com.demo.patch.PatchesLoaderImpl"
+        const val DEFAULT_SDK_PACKAGE  = "com.demo.hotfix"
     }
 }

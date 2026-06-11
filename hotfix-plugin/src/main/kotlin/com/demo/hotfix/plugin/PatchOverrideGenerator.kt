@@ -29,8 +29,6 @@ import java.io.File
  */
 object PatchOverrideGenerator {
 
-    private const val IPCHANGE = "com/demo/hotfix/core/IpChange"
-    private const val PATCHES_LOADER = "com/demo/hotfix/core/PatchesLoader"
     private val OBJECT_T = Type.getType(Any::class.java)
     private val STRING_T = Type.getType(String::class.java)
     private val MAP_T = Type.getType("Ljava/util/Map;")
@@ -42,7 +40,11 @@ object PatchOverrideGenerator {
         baseVersion: String,
         mappingFile: File?,
         loaderClass: String = HotfixPatchExtension.DEFAULT_LOADER_CLASS,
+        sdkPackage: String = HotfixPatchExtension.DEFAULT_SDK_PACKAGE,
     ) {
+        val sdkInternal = sdkPackage.replace('.', '/')
+        val IPCHANGE = "$sdkInternal/core/IpChange"
+        val PATCHES_LOADER = "$sdkInternal/core/PatchesLoader"
         val classes = inDir.walkTopDown()
             .filter { it.isFile && it.extension == "class" }
             .filter { !it.nameWithoutExtension.contains('$') }   // 跳过嵌套/合成类
@@ -62,13 +64,13 @@ object PatchOverrideGenerator {
             if (cn.access and (Opcodes.ACC_INTERFACE or Opcodes.ACC_ANNOTATION) != 0) continue
             val origDot = cn.name.replace('/', '.')
             val runtimeName = classMapping[origDot] ?: origDot
-            val (dispName, bytes) = genDispatcher(cn, runtimeName, patchPkg)
+            val (dispName, bytes) = genDispatcher(cn, runtimeName, patchPkg, IPCHANGE)
             write(outDir, dispName, bytes)
             loaderEntries[runtimeName] = dispName
             println("[PatchOverrideGenerator] ${cn.name} -> $dispName  (运行时 key=$runtimeName, ${bytes.size}B)")
         }
 
-        val loaderBytes = genLoader(loaderEntries, baseVersion, loaderInternal)
+        val loaderBytes = genLoader(loaderEntries, baseVersion, loaderInternal, PATCHES_LOADER)
         write(outDir, loaderInternal, loaderBytes)
         println("[PatchOverrideGenerator] $loaderInternal  (baseVersion=$baseVersion, ${loaderEntries.size} 条映射)")
     }
@@ -128,7 +130,7 @@ object PatchOverrideGenerator {
      *   若仍用原始名 com/demo/app/Calculator，release 下该类已不存在 -> NoClassDefFoundError。
      * @param patchPkg 补丁类所在包的内部名（如 com/demo/patch），与 loaderClass 同包。
      */
-    private fun genDispatcher(cn: ClassNode, runtimeDotName: String, patchPkg: String): Pair<String, ByteArray> {
+    private fun genDispatcher(cn: ClassNode, runtimeDotName: String, patchPkg: String, ipChange: String): Pair<String, ByteArray> {
         val origInternal = cn.name                               // com/demo/app/Calculator —— 仅用于 methodId
         val ownerInternal = runtimeDotName.replace('.', '/')     // 运行时(混淆)内部名，如 a/a
         val ownerType = Type.getObjectType(ownerInternal)
@@ -137,7 +139,7 @@ object PatchOverrideGenerator {
         val dispType = Type.getObjectType(dispName)
 
         val cw = newWriter()
-        cw.visit(Opcodes.V1_8, Opcodes.ACC_PUBLIC or Opcodes.ACC_SUPER, dispName, null, "java/lang/Object", arrayOf(IPCHANGE))
+        cw.visit(Opcodes.V1_8, Opcodes.ACC_PUBLIC or Opcodes.ACC_SUPER, dispName, null, "java/lang/Object", arrayOf(ipChange))
         emitDefaultCtor(cw)
 
         val skip = Opcodes.ACC_ABSTRACT or Opcodes.ACC_NATIVE or Opcodes.ACC_SYNTHETIC or Opcodes.ACC_BRIDGE
@@ -244,9 +246,9 @@ object PatchOverrideGenerator {
     }
 
     /** 生成 PatchesLoaderImpl：load() 返回 HashMap{运行时名 -> new <X>Patch()}；baseVersion() 返回常量。 */
-    private fun genLoader(entries: Map<String, String>, baseVersion: String, loaderInternal: String): ByteArray {
+    private fun genLoader(entries: Map<String, String>, baseVersion: String, loaderInternal: String, patchesLoader: String): ByteArray {
         val cw = newWriter()
-        cw.visit(Opcodes.V1_8, Opcodes.ACC_PUBLIC or Opcodes.ACC_SUPER, loaderInternal, null, "java/lang/Object", arrayOf(PATCHES_LOADER))
+        cw.visit(Opcodes.V1_8, Opcodes.ACC_PUBLIC or Opcodes.ACC_SUPER, loaderInternal, null, "java/lang/Object", arrayOf(patchesLoader))
         emitDefaultCtor(cw)
 
         // load()Ljava/util/Map;
