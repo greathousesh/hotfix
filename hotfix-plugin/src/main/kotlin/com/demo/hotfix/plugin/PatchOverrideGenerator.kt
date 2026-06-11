@@ -29,22 +29,24 @@ import java.io.File
  */
 object PatchOverrideGenerator {
 
-    private val OBJECT_T = Type.getType(Any::class.java)
-    private val STRING_T = Type.getType(String::class.java)
-    private val MAP_T = Type.getType("Ljava/util/Map;")
+    private val OBJECT_T  = Type.getType(Any::class.java)
+    private val MAP_T     = Type.getType("Ljava/util/Map;")
     private val HASHMAP_T = Type.getType("Ljava/util/HashMap;")
 
-    fun generate(
-        inDir: File,
-        outDir: File,
-        baseVersion: String,
-        mappingFile: File?,
-        loaderClass: String = HotfixPatchExtension.DEFAULT_LOADER_CLASS,
-        sdkPackage: String = HotfixPatchExtension.DEFAULT_SDK_PACKAGE,
+    // 生成配置：收口所有外部参数，避免逐层透传
+    data class Config(
+        val baseVersion: String,
+        val mappingFile: File?,
+        val loaderClass: String = HotfixPatchExtension.DEFAULT_LOADER_CLASS,
+        val sdkPackage:  String = HotfixPatchExtension.DEFAULT_SDK_PACKAGE,
     ) {
-        val sdkInternal = sdkPackage.replace('.', '/')
-        val IPCHANGE = "$sdkInternal/core/IpChange"
-        val PATCHES_LOADER = "$sdkInternal/core/PatchesLoader"
+        val loaderInternal: String = loaderClass.replace('.', '/')
+        val patchPkg:       String = loaderInternal.substringBeforeLast('/')
+        val ipChange:       String = "${sdkPackage.replace('.', '/')}/core/IpChange"
+        val patchesLoader:  String = "${sdkPackage.replace('.', '/')}/core/PatchesLoader"
+    }
+
+    fun generate(inDir: File, outDir: File, config: Config) {
         val classes = inDir.walkTopDown()
             .filter { it.isFile && it.extension == "class" }
             .filter { !it.nameWithoutExtension.contains('$') }   // 跳过嵌套/合成类
@@ -52,28 +54,35 @@ object PatchOverrideGenerator {
         require(classes.isNotEmpty()) { "no .class found under $inDir" }
 
         // mapping.txt 一次性解析成 orig(点分) -> obf(点分)；无 mapping(debug) 则为空表、查不到回退原名。
-        val classMapping = parseClassMapping(mappingFile)
-
-        val loaderInternal = loaderClass.replace('.', '/')
-        val patchPkg = loaderInternal.substringBeforeLast('/')
+        val classMapping = parseClassMapping(config.mappingFile)
 
         // 运行时类名 -> 分发类内部名（供 PatchesLoaderImpl 装 Map）
         val loaderEntries = LinkedHashMap<String, String>()
         for (cf in classes) {
             val cn = ClassNode().also { ClassReader(cf.readBytes()).accept(it, ClassReader.SKIP_FRAMES) }
             if (cn.access and (Opcodes.ACC_INTERFACE or Opcodes.ACC_ANNOTATION) != 0) continue
-            val origDot = cn.name.replace('/', '.')
+            val origDot    = cn.name.replace('/', '.')
             val runtimeName = classMapping[origDot] ?: origDot
-            val (dispName, bytes) = genDispatcher(cn, runtimeName, patchPkg, IPCHANGE)
+            val (dispName, bytes) = genDispatcher(cn, runtimeName, config)
             write(outDir, dispName, bytes)
             loaderEntries[runtimeName] = dispName
             println("[PatchOverrideGenerator] ${cn.name} -> $dispName  (运行时 key=$runtimeName, ${bytes.size}B)")
         }
 
-        val loaderBytes = genLoader(loaderEntries, baseVersion, loaderInternal, PATCHES_LOADER)
-        write(outDir, loaderInternal, loaderBytes)
-        println("[PatchOverrideGenerator] $loaderInternal  (baseVersion=$baseVersion, ${loaderEntries.size} 条映射)")
+        val loaderBytes = genLoader(loaderEntries, config)
+        write(outDir, config.loaderInternal, loaderBytes)
+        println("[PatchOverrideGenerator] ${config.loaderInternal}  (baseVersion=${config.baseVersion}, ${loaderEntries.size} 条映射)")
     }
+
+    // 保留旧签名作为便捷入口，内部构造 Config 后转发
+    fun generate(
+        inDir: File,
+        outDir: File,
+        baseVersion: String,
+        mappingFile: File?,
+        loaderClass: String = HotfixPatchExtension.DEFAULT_LOADER_CLASS,
+        sdkPackage:  String = HotfixPatchExtension.DEFAULT_SDK_PACKAGE,
+    ) = generate(inDir, outDir, Config(baseVersion, mappingFile, loaderClass, sdkPackage))
 
     /**
      * 解析 proguard/R8 mapping.txt 的**类重命名行** `com.demo.app.Calculator -> a.a:`。
@@ -128,46 +137,63 @@ object PatchOverrideGenerator {
      * @param runtimeDotName 该类在**运行时宿主**里的类名（release 为 R8 混淆名，如 a.a；debug 为原名）。
      *   跳板首参(self)类型与 ipcDispatch 里的 checkcast 必须用这个名字 —— 宿主传进来的 args[0] 是混淆类的实例，
      *   若仍用原始名 com/demo/app/Calculator，release 下该类已不存在 -> NoClassDefFoundError。
-     * @param patchPkg 补丁类所在包的内部名（如 com/demo/patch），与 loaderClass 同包。
      */
-    private fun genDispatcher(cn: ClassNode, runtimeDotName: String, patchPkg: String, ipChange: String): Pair<String, ByteArray> {
-        val origInternal = cn.name                               // com/demo/app/Calculator —— 仅用于 methodId
-        val ownerInternal = runtimeDotName.replace('.', '/')     // 运行时(混淆)内部名，如 a/a
-        val ownerType = Type.getObjectType(ownerInternal)
-        val simple = origInternal.substringAfterLast('/')
-        val dispName = "$patchPkg/${simple}Patch"                // com/demo/patch/CalculatorPatch
+    private fun genDispatcher(cn: ClassNode, runtimeDotName: String, config: Config): Pair<String, ByteArray> {
+        val origInternal = cn.name
+        val ownerInternal = runtimeDotName.replace('.', '/')
+        val simple   = origInternal.substringAfterLast('/')
+        val dispName = "${config.patchPkg}/${simple}Patch"
         val dispType = Type.getObjectType(dispName)
 
         val cw = newWriter()
-        cw.visit(Opcodes.V1_8, Opcodes.ACC_PUBLIC or Opcodes.ACC_SUPER, dispName, null, "java/lang/Object", arrayOf(ipChange))
+        cw.visit(Opcodes.V1_8, Opcodes.ACC_PUBLIC or Opcodes.ACC_SUPER, dispName, null, "java/lang/Object", arrayOf(config.ipChange))
         emitDefaultCtor(cw)
 
+        val entries = emitTrampolines(cn, ownerInternal, origInternal, dispName, cw)
+        emitDispatchIndex(entries, dispType, cw)
+        emitIpcDispatch(entries, dispType, cw)
+
+        cw.visitEnd()
+        return dispName to cw.toByteArray()
+    }
+
+    /** 把被修类的每个可插桩方法转成 static 跳板 _p0/_p1/...，实例方法前插 self 首参保持 slot 对齐。 */
+    private fun emitTrampolines(
+        cn: ClassNode,
+        ownerInternal: String,
+        origInternal: String,
+        dispName: String,
+        cw: ClassWriter,
+    ): List<Entry> {
+        val ownerType = Type.getObjectType(ownerInternal)
         val skip = Opcodes.ACC_ABSTRACT or Opcodes.ACC_NATIVE or Opcodes.ACC_SYNTHETIC or Opcodes.ACC_BRIDGE
         val entries = ArrayList<Entry>()
-        var idx = 0
-        for (m in cn.methods) {
+
+        for ((trampIdx, m) in cn.methods.withIndex()) {
             if (m.name == "<init>" || m.name == "<clinit>") continue
             if (m.access and skip != 0) continue
-            val isStatic = m.access and Opcodes.ACC_STATIC != 0
-            val origArgs = Type.getArgumentTypes(m.desc)
-            val ret = Type.getReturnType(m.desc)
+            val isStatic  = m.access and Opcodes.ACC_STATIC != 0
+            val origArgs  = Type.getArgumentTypes(m.desc)
+            val ret       = Type.getReturnType(m.desc)
             // 实例方法：前插 owner 作首参(self)；原 slot0=this，转 static 后 slot0=self，槽位不变，方法体原样复用。
             val trampArgs = if (isStatic) origArgs else arrayOf(ownerType, *origArgs)
             val trampDesc = Type.getMethodDescriptor(ret, *trampArgs)
-            val trampName = "_p$idx"
+            val trampName = "_p$trampIdx"
 
             val mn = MethodNode(Opcodes.ACC_PUBLIC or Opcodes.ACC_STATIC, trampName, trampDesc, null, m.exceptions?.toTypedArray())
-            mn.instructions = m.instructions          // 只搬方法体，丢弃调试信息(参数表/局部变量表)避免 self 首参错位
-            mn.tryCatchBlocks = m.tryCatchBlocks
+            mn.instructions    = m.instructions   // 只搬方法体，丢弃调试信息(参数表/局部变量表)避免 self 首参错位
+            mn.tryCatchBlocks  = m.tryCatchBlocks
             // 不拷 maxStack/maxLocals：COMPUTE_FRAMES 会连 maxs 一起重算，传什么都被忽略。
             mn.accept(cw)
 
             // methodId 用**原始**类名 —— 与 HotfixMethodVisitor 烤进宿主方法头的字符串常量对齐(R8 不改字符串)。
             entries += Entry(methodId(origInternal, m.name, m.desc), trampName, trampDesc, trampArgs, ret)
-            idx++
         }
+        return entries
+    }
 
-        // 静态字段 DISPATCH_IDX: Map<String, Integer>（methodId -> 整数索引）
+    /** 生成静态字段 DISPATCH_IDX（Map<String,Integer>）及其 <clinit> 初始化，供 ipcDispatch O(1) 查表。 */
+    private fun emitDispatchIndex(entries: List<Entry>, dispType: Type, cw: ClassWriter) {
         cw.visitField(
             Opcodes.ACC_PRIVATE or Opcodes.ACC_STATIC or Opcodes.ACC_FINAL,
             "DISPATCH_IDX", "Ljava/util/Map;",
@@ -180,75 +206,78 @@ object PatchOverrideGenerator {
         si.dup()
         si.invokeConstructor(HASHMAP_T, AsmMethod("<init>", "()V"))
         si.putStatic(dispType, "DISPATCH_IDX", MAP_T)
-        for ((idx, e) in entries.withIndex()) {
+        for ((i, e) in entries.withIndex()) {
             si.getStatic(dispType, "DISPATCH_IDX", MAP_T)
             si.push(e.methodId)
-            si.push(idx)
-            si.box(Type.INT_TYPE)   // Integer.valueOf(idx)
+            si.push(i)
+            si.box(Type.INT_TYPE)
             si.invokeInterface(MAP_T, AsmMethod("put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"))
             si.pop()
         }
         si.returnValue()
         si.endMethod()
+    }
 
-        // ipcDispatch：HashMap.get(methodId) -> Integer -> tableswitch -> 拆箱调跳板 -> 装箱返回
+    /** 生成 ipcDispatch：HashMap.get(methodId) -> Integer -> tableswitch -> 拆箱调跳板 -> 装箱返回。 */
+    private fun emitIpcDispatch(entries: List<Entry>, dispType: Type, cw: ClassWriter) {
         val integerType = Type.getType(Integer::class.java)
         val ga = GeneratorAdapter(Opcodes.ACC_PUBLIC, AsmMethod("ipcDispatch", "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/Object;"), null, null, cw)
+
         if (entries.isEmpty()) {
             ga.throwException(Type.getType(IllegalStateException::class.java), "unknown method")
-        } else {
-            val nullBranch = ga.newLabel()      // methodId 不在表中时的 pop+throw
-            val defaultBranch = ga.newLabel()   // tableswitch default（理论上不可达）
-
-            // Integer i = DISPATCH_IDX.get(methodId)
-            ga.getStatic(dispType, "DISPATCH_IDX", MAP_T)
-            ga.loadArg(0)
-            ga.invokeInterface(MAP_T, AsmMethod("get", "(Ljava/lang/Object;)Ljava/lang/Object;"))
-
-            // if (i == null) goto nullBranch（dup 保留栈顶供 nullBranch 的 pop 使用）
-            ga.dup()
-            ga.ifNull(nullBranch)
-
-            // int idx = ((Integer) i).intValue()
-            ga.checkCast(integerType)
-            ga.invokeVirtual(integerType, AsmMethod("intValue", "()I"))
-
-            // tableswitch 0..n-1，default -> defaultBranch
-            val caseLabels = Array(entries.size) { ga.newLabel() }
-            ga.visitTableSwitchInsn(0, entries.size - 1, defaultBranch, *caseLabels)
-
-            for ((ci, e) in entries.withIndex()) {
-                ga.mark(caseLabels[ci])
-                e.trampArgs.forEachIndexed { i, t ->
-                    ga.loadArg(1)
-                    ga.push(i)
-                    ga.arrayLoad(OBJECT_T)
-                    ga.unbox(t)
-                }
-                ga.invokeStatic(dispType, AsmMethod(e.trampName, e.trampDesc))
-                if (e.ret.sort == Type.VOID) ga.visitInsn(Opcodes.ACONST_NULL) else ga.box(e.ret)
-                ga.returnValue()
-            }
-
-            // null 分支：弹掉栈顶 null 再抛
-            ga.mark(nullBranch)
-            ga.pop()
-            ga.throwException(Type.getType(IllegalStateException::class.java), "unknown method")
-
-            // default 分支（理论上不可达，防御用）
-            ga.mark(defaultBranch)
-            ga.throwException(Type.getType(IllegalStateException::class.java), "unknown method")
+            ga.endMethod()
+            return
         }
-        ga.endMethod()
 
-        cw.visitEnd()
-        return dispName to cw.toByteArray()
+        val nullBranch    = ga.newLabel()   // methodId 不在表中时的 pop+throw
+        val defaultBranch = ga.newLabel()   // tableswitch default（理论上不可达）
+
+        // Integer i = DISPATCH_IDX.get(methodId)
+        ga.getStatic(dispType, "DISPATCH_IDX", MAP_T)
+        ga.loadArg(0)
+        ga.invokeInterface(MAP_T, AsmMethod("get", "(Ljava/lang/Object;)Ljava/lang/Object;"))
+
+        // if (i == null) goto nullBranch（dup 保留栈顶供 nullBranch 的 pop 使用）
+        ga.dup()
+        ga.ifNull(nullBranch)
+
+        // int idx = ((Integer) i).intValue()
+        ga.checkCast(integerType)
+        ga.invokeVirtual(integerType, AsmMethod("intValue", "()I"))
+
+        // tableswitch 0..n-1，default -> defaultBranch
+        val caseLabels = Array(entries.size) { ga.newLabel() }
+        ga.visitTableSwitchInsn(0, entries.size - 1, defaultBranch, *caseLabels)
+
+        for ((i, e) in entries.withIndex()) {
+            ga.mark(caseLabels[i])
+            e.trampArgs.forEachIndexed { argIdx, t ->
+                ga.loadArg(1)
+                ga.push(argIdx)
+                ga.arrayLoad(OBJECT_T)
+                ga.unbox(t)
+            }
+            ga.invokeStatic(dispType, AsmMethod(e.trampName, e.trampDesc))
+            if (e.ret.sort == Type.VOID) ga.visitInsn(Opcodes.ACONST_NULL) else ga.box(e.ret)
+            ga.returnValue()
+        }
+
+        // null 分支：弹掉栈顶 null 再抛
+        ga.mark(nullBranch)
+        ga.pop()
+        ga.throwException(Type.getType(IllegalStateException::class.java), "unknown method")
+
+        // default 分支（理论上不可达，防御用）
+        ga.mark(defaultBranch)
+        ga.throwException(Type.getType(IllegalStateException::class.java), "unknown method")
+
+        ga.endMethod()
     }
 
     /** 生成 PatchesLoaderImpl：load() 返回 HashMap{运行时名 -> new <X>Patch()}；baseVersion() 返回常量。 */
-    private fun genLoader(entries: Map<String, String>, baseVersion: String, loaderInternal: String, patchesLoader: String): ByteArray {
+    private fun genLoader(entries: Map<String, String>, config: Config): ByteArray {
         val cw = newWriter()
-        cw.visit(Opcodes.V1_8, Opcodes.ACC_PUBLIC or Opcodes.ACC_SUPER, loaderInternal, null, "java/lang/Object", arrayOf(patchesLoader))
+        cw.visit(Opcodes.V1_8, Opcodes.ACC_PUBLIC or Opcodes.ACC_SUPER, config.loaderInternal, null, "java/lang/Object", arrayOf(config.patchesLoader))
         emitDefaultCtor(cw)
 
         // load()Ljava/util/Map;
@@ -274,7 +303,7 @@ object PatchOverrideGenerator {
 
         // baseVersion()Ljava/lang/String;
         val gv = GeneratorAdapter(Opcodes.ACC_PUBLIC, AsmMethod("baseVersion", "()Ljava/lang/String;"), null, null, cw)
-        gv.push(baseVersion)
+        gv.push(config.baseVersion)
         gv.returnValue()
         gv.endMethod()
 
