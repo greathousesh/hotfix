@@ -55,8 +55,8 @@ class HotfixPatchPlugin : Plugin<Project> {
         for (variant in listOf("debug", "release")) {
             val V = variant.replaceFirstChar { it.uppercase() }
             val patchDir = project.layout.buildDirectory.dir("patch/$variant")
-            // AGP+KGP 把被修类编到这里（patched/Calculator.kt -> com/demo/app/Calculator.class）
-            val kotlinClasses = project.layout.buildDirectory.dir("tmp/kotlin-classes/$variant")
+            // AGP 9 built-in Kotlin output (replaces old tmp/kotlin-classes/$variant path)
+            val kotlinClasses = project.layout.buildDirectory.dir("intermediates/built_in_kotlinc/$variant/compile${V}Kotlin/classes")
             val hostApk = project.rootProject.layout.projectDirectory
                 .file("app/build/outputs/apk/$variant/app-$variant.apk")
             // release 用 R8 的 mapping.txt 把被修类解析成混淆名；debug 无此文件 -> 用原始名

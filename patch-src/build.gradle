@@ -22,7 +22,7 @@ android {
     // 补丁源是非标准目录布局：patched/ 放修好的原始类；res_patch/ 放资源补丁。
     sourceSets {
         main {
-            java.srcDirs = ['patched']   // kotlin-android 会编译此目录下的 .kt
+            kotlin.srcDirs = ['patched']   // AGP 9 built-in Kotlin: .kt files must be in kotlin.srcDirs
             res.srcDirs = ['res_patch']
             manifest.srcFile 'AndroidManifest.xml'
         }
