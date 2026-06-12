@@ -29,8 +29,7 @@ class MainActivity : Activity() {
         Hotfix.init(application, "1.0.0")
 
         findViewById<android.widget.Button>(R.id.btn_java).setOnClickListener {
-            log("Java  Calculator.add(2,3) = ${Calculator().add(2, 3)}  (期望11: fixed.value()=5 + multiply(2,3)=6)\n" +
-                "Java  Calculator.multiply(3,4) = ${Calculator.multiply(3, 4)}  (期望12)")
+            log("Java  Calculator.add(2,3) = ${Calculator().add(2, 3)}  (期望11: fixed.value()=5 + multiply(2,3)=6)\n")
         }
         findViewById<android.widget.Button>(R.id.btn_res).setOnClickListener {
             log("Res   string/patch_text = ${getString(R.string.patch_text)}")

@@ -11,9 +11,9 @@ package com.demo.app
  * 注意：Kotlin 类默认 final、方法默认 final，不影响 ASM 改写方法体与注入静态字段。
  */
 class Calculator {
-    fun add(a: Int, b: Int): Int = a - b   // BUG：本应 a + b，补丁会修复
 
-    companion object {
-        fun multiply(a: Int, b: Int): Int = a + b   // BUG：本应 a * b，补丁会修复
+    fun test(a: Int, b: Int): Int {
+        return a + 1 + b
     }
+    fun add(a: Int, b: Int): Int = a - b   // BUG：本应 a + b，补丁会修复
 }

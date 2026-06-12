@@ -259,6 +259,30 @@ object PatchOverrideGenerator {
         remapper: Remapper,
         private val crossCallMap: Map<String, Triple<String, String, String>>,
     ) : MethodRemapper(delegate, remapper) {
+
+        // Internal names of all classes whose methods are cross-patch redirected.
+        private val crossPatchOwners: Set<String> = crossCallMap.keys
+            .mapTo(HashSet()) { it.substringBefore('\n') }
+
+        /**
+         * Intercept GETSTATIC that loads a companion-object instance whose class is being
+         * cross-patch redirected.  The companion may have been removed from the host app,
+         * so the field no longer exists there.  Replace with ACONST_NULL — the trampoline
+         * signature still accepts the companion as first arg, but companion methods that are
+         * pure functions (no `this` access) work correctly with a null receiver.
+         */
+        override fun visitFieldInsn(opcode: Int, owner: String, name: String, descriptor: String) {
+            if (opcode == Opcodes.GETSTATIC &&
+                descriptor.length > 2 && descriptor[0] == 'L' && descriptor.last() == ';') {
+                val fieldType = descriptor.substring(1, descriptor.length - 1)
+                if (fieldType in crossPatchOwners) {
+                    mv.visitInsn(Opcodes.ACONST_NULL)
+                    return
+                }
+            }
+            super.visitFieldInsn(opcode, owner, name, descriptor)
+        }
+
         override fun visitMethodInsn(opcode: Int, owner: String, name: String, descriptor: String, isInterface: Boolean) {
             val redirect = crossCallMap["$owner\n$name\n$descriptor"]
             if (redirect != null) {

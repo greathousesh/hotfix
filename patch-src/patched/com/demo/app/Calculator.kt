@@ -1,5 +1,7 @@
 package com.demo.app
 
+import android.util.Log
+
 /**
  * 补丁源 —— 开发者**直接编写修好的原始类**（同包同名、纯业务代码，无任何分发样板）。
  *
@@ -13,11 +15,21 @@ package com.demo.app
  * 那属于冷补丁/重启场景）。想验证补丁是否真的生效：把下面改回 a - b，重打补丁后结果应变回 -1。
  */
 class Calculator {
+
+    fun test(a: Int, b: Int): Int {
+        return a + 1 + b
+    }
+
     fun add(a: Int, b: Int): Int {
         val fixed = object {
             fun value(): Int = a + b
         }
-        return fixed.value() + multiply(a, b)
+        return fixed.value() + multiply(a, b) + test(1, 1) + test1(1, 2)
+    }
+
+    fun test1(a: Int, b: Int): Int {
+        Log.e("test", "test1")
+        return a + b + 3
     }
 
     companion object {
