@@ -1,6 +1,5 @@
 plugins {
     id 'com.android.application'
-    id 'org.jetbrains.kotlin.android'
     id 'com.demo.hotfix.instrument'   // 编译期自动插桩（注入 $ipChange + 方法头转发）
 }
 
@@ -26,9 +25,7 @@ android {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
     }
-    kotlinOptions {
-        jvmTarget = '17'
-    }
+
     buildTypes {
         debug {
             minifyEnabled false
@@ -47,5 +44,4 @@ hotfix {
 
 dependencies {
     implementation project(':hotfix-sdk')
-    implementation 'org.jetbrains.kotlin:kotlin-stdlib:1.9.24'
 }

@@ -9,7 +9,6 @@
 //    ./gradlew :patch-src:assemblePatchRelease   # 出 release 三类产物（需先 :app:assembleRelease 产 mapping）
 plugins {
     id 'com.android.library'
-    id 'org.jetbrains.kotlin.android'
     id 'com.demo.hotfix.patch'
 }
 
@@ -32,9 +31,7 @@ android {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
     }
-    kotlinOptions {
-        jvmTarget = '17'
-    }
+
 }
 
 dependencies {

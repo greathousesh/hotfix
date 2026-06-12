@@ -1,6 +1,6 @@
 plugins {
     id 'java-gradle-plugin'
-    id 'org.jetbrains.kotlin.jvm' version '1.9.24'
+    id 'org.jetbrains.kotlin.jvm' version '2.2.10'
 }
 
 kotlin {
@@ -8,7 +8,7 @@ kotlin {
 }
 
 dependencies {
-    compileOnly 'com.android.tools.build:gradle-api:8.6.0'
+    compileOnly 'com.android.tools.build:gradle-api:9.0.1'
     implementation 'org.ow2.asm:asm:9.7'
     implementation 'org.ow2.asm:asm-commons:9.7'
     implementation 'org.ow2.asm:asm-tree:9.7'   // ClassNode/MethodNode：把修好的原方法体拷进生成的补丁分发类
